@@ -104,7 +104,10 @@ if(BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR)
 endif()
 
 if(_bvc_have_slicer)
-    target_include_directories(bambu_virtual_client PRIVATE
+    # PUBLIC: the lib's headers transitively #include "BambuTunnel.h" and
+    # rely on the slicer's bambu_networking.hpp / GUI_App.hpp on the include
+    # path. Consumers (libslic3r_gui) need to see those headers too.
+    target_include_directories(bambu_virtual_client PUBLIC
         ${BAMBU_VIRTUAL_CLIENT_SLIC3R_INCLUDE_DIR}
         ${BAMBU_VIRTUAL_CLIENT_SLICER_SRC_DIR}
         ${BAMBU_VIRTUAL_CLIENT_SLIC3R_INCLUDE_DIR}/GUI/Printer
