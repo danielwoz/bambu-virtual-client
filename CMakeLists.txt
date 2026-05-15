@@ -109,6 +109,12 @@ if(_bvc_have_slicer)
         ${BAMBU_VIRTUAL_CLIENT_SLICER_SRC_DIR}
         ${BAMBU_VIRTUAL_CLIENT_SLIC3R_INCLUDE_DIR}/GUI/Printer
     )
+    # Extra include dirs (typically the generated header tree under
+    # ${CMAKE_BINARY_DIR}/src/libslic3r/, ${CMAKE_BINARY_DIR}/src/slic3r/)
+    if(BAMBU_VIRTUAL_CLIENT_EXTRA_INCLUDE_DIRS)
+        target_include_directories(bambu_virtual_client PRIVATE
+            ${BAMBU_VIRTUAL_CLIENT_EXTRA_INCLUDE_DIRS})
+    endif()
 endif()
 
 target_link_libraries(bambu_virtual_client
