@@ -1,4 +1,11 @@
 // VirtualMqttClient implementation. See header for design rationale.
+//
+// Networking: boost::asio for TCP + DNS resolve. TLS: raw OpenSSL
+// (TLS 1.2, verify=false) on top of the asio socket's native_handle().
+// The asio socket's fd is release()d into SSL_set_fd so the rest of
+// the SSL_read/SSL_write logic (and the session I/O loop) remains
+// unchanged. This makes the module compile on Windows where
+// <sys/socket.h>/<netdb.h>/<arpa/inet.h> aren't available.
 
 #include "VirtualMqttClient.hpp"
 
@@ -7,19 +14,24 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <boost/asio.hpp>
+#include <boost/system/error_code.hpp>
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#else
+#  include <sys/socket.h>
+#  include <unistd.h>
+#endif
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -29,6 +41,9 @@ namespace Slic3r {
 namespace {
 
 namespace mqtt = ::Slic3r::virtual_mqtt;
+namespace asio = boost::asio;
+using asio::ip::tcp;
+using boost::system::error_code;
 
 // MQTT 3.1.1 control-packet types (high nibble of the fixed header).
 constexpr uint8_t MQTT_CONNECT   = 0x10;
@@ -105,25 +120,56 @@ std::vector<uint8_t> encode_disconnect()
     return { MQTT_DISCONNECT, 0x00 };
 }
 
-// Open a TCP socket to host:port. Returns fd or -1.
+// Open a TCP socket to host:port via boost::asio. Returns the released
+// native socket fd, or -1 on failure. The asio socket is release()d so
+// the fd's lifetime is owned by the caller (handed to OpenSSL via
+// SSL_set_fd). Synchronous — runs on the caller's thread.
 int tcp_connect(const std::string& host, uint16_t port) {
-    addrinfo hints{};
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    const std::string port_str = std::to_string(port);
-    if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0)
+    try {
+        asio::io_context io;
+        tcp::resolver resolver(io);
+        error_code ec;
+        auto endpoints = resolver.resolve(host, std::to_string(port), ec);
+        if (ec) return -1;
+        tcp::socket sock(io);
+        asio::connect(sock, endpoints, ec);
+        if (ec) return -1;
+        auto native = sock.native_handle();
+        error_code rel_ec;
+        sock.release(rel_ec);
+        return static_cast<int>(native);
+    } catch (const std::exception&) {
         return -1;
-    int fd = -1;
-    for (auto* a = res; a; a = a->ai_next) {
-        fd = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (fd < 0) continue;
-        if (::connect(fd, a->ai_addr, a->ai_addrlen) == 0) break;
-        ::close(fd);
-        fd = -1;
     }
-    ::freeaddrinfo(res);
-    return fd;
+}
+
+// Cross-platform fd close. The fd we manage was obtained via
+// tcp::socket::release(), so it owns the system socket — close it the
+// way the platform expects.
+inline void close_fd(int fd) {
+    if (fd < 0) return;
+#ifdef _WIN32
+    ::closesocket(fd);
+#else
+    ::close(fd);
+#endif
+}
+
+// Cross-platform half-close. Called before close_fd to unblock any
+// in-flight SSL_read on the I/O thread.
+inline void shutdown_fd(int fd) {
+    if (fd < 0) return;
+#ifdef _WIN32
+    ::shutdown(fd, SD_BOTH);
+#else
+    ::shutdown(fd, SHUT_RDWR);
+#endif
+}
+
+// Sleep for ms milliseconds — portable across POSIX and Windows
+// (avoids ::usleep which is POSIX-only).
+inline void sleep_ms(int ms) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
 } // namespace
@@ -255,7 +301,7 @@ int VirtualMqttClient::connect_printer(std::string dev_id,
     } else {
         ssl = SSL_new(static_cast<SSL_CTX*>(m_ssl_ctx));
         if (!ssl) {
-            ::close(fd);
+            close_fd(fd);
             fd = -1;
         } else {
             SSL_set_fd(ssl, fd);
@@ -265,7 +311,7 @@ int VirtualMqttClient::connect_printer(std::string dev_id,
                 const auto err_q   = ERR_get_error();
                 SSL_free(ssl);
                 ssl = nullptr;
-                ::close(fd);
+                close_fd(fd);
                 fd = -1;
             }
         }
@@ -313,7 +359,7 @@ int VirtualMqttClient::disconnect_printer(std::string dev_id) {
     //   4) free SSL and close fd.
     doomed->stopped.store(true);
     if (doomed->fd >= 0)
-        ::shutdown(doomed->fd, SHUT_RDWR);
+        shutdown_fd(doomed->fd);
     if (doomed->io_thread.joinable())
         doomed->io_thread.join();
     if (doomed->ssl) {
@@ -322,7 +368,7 @@ int VirtualMqttClient::disconnect_printer(std::string dev_id) {
         doomed->ssl = nullptr;
     }
     if (doomed->fd >= 0) {
-        ::close(doomed->fd);
+        close_fd(doomed->fd);
         doomed->fd = -1;
     }
     return 0;
@@ -405,11 +451,11 @@ void VirtualMqttClient::session_loop(VirtualMqttClient* self,
         int new_fd = tcp_connect(sess->host, sess->port);
         if (new_fd < 0) return false;
         SSL* new_ssl = SSL_new(static_cast<SSL_CTX*>(self->m_ssl_ctx));
-        if (!new_ssl) { ::close(new_fd); return false; }
+        if (!new_ssl) { close_fd(new_fd); return false; }
         SSL_set_fd(new_ssl, new_fd);
         if (SSL_connect(new_ssl) != 1) {
             SSL_free(new_ssl);
-            ::close(new_fd);
+            close_fd(new_fd);
             return false;
         }
         // Publish to Session under write_mu (send_message also takes it).
@@ -449,7 +495,7 @@ void VirtualMqttClient::session_loop(VirtualMqttClient* self,
         if (!first_attempt) {
             for (int i = 0; i < backoff_s * 10; ++i) {
                 if (sess->stopped.load()) return;
-                ::usleep(100 * 1000); // 100 ms slices for prompt stop
+                sleep_ms(100); // 100 ms slices for prompt stop
             }
             if (sess->stopped.load()) return;
             if (!reopen_tls()) {
@@ -547,7 +593,7 @@ read_loop_exit:
                 sess->ssl = nullptr;
             }
             if (sess->fd >= 0) {
-                ::close(sess->fd);
+                close_fd(sess->fd);
                 sess->fd = -1;
             }
         }
