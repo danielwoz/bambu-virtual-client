@@ -1,12 +1,19 @@
 // VirtualFtpsClient implementation. Implicit-TLS FTPS — server expects
 // TLS handshake immediately on connect, no AUTH command. Bambu's
 // printers and the bridge's FtpsServer both use this shape.
+//
+// Networking: boost::asio for TCP + DNS resolve. TLS: raw OpenSSL
+// (TLS 1.2, verify=false) on top of the asio socket's native_handle().
+// This matches the slicer's wider networking style (HttpServer.cpp,
+// MKS.cpp, TCPConsole.cpp all use asio TCP) while keeping the existing
+// SSL_read/SSL_write logic intact.
 
 #include "VirtualFtpsClient.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -15,18 +22,25 @@
 #include <string>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <boost/asio.hpp>
+#include <boost/system/error_code.hpp>
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#else
+#  include <sys/socket.h>
+#endif
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
 namespace Slic3r {
 namespace virtual_ftps {
+
+namespace asio = boost::asio;
+using asio::ip::tcp;
+using boost::system::error_code;
 
 namespace {
 
@@ -47,24 +61,39 @@ SSL_CTX* ensure_ctx() {
     return g_ctx;
 }
 
-int tcp_connect(const std::string& host, uint16_t port) {
-    addrinfo hints{};
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    const std::string port_str = std::to_string(port);
-    if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0)
+// Establish a synchronous TCP connection to host:port via asio. Returns
+// the native socket fd or -1 on failure. The asio socket is released so
+// the fd's lifetime is owned by the caller (handed to OpenSSL).
+int tcp_connect_asio(const std::string& host, uint16_t port) {
+    try {
+        asio::io_context io;
+        tcp::resolver resolver(io);
+        error_code ec;
+        auto endpoints = resolver.resolve(host, std::to_string(port), ec);
+        if (ec) {
+            std::fprintf(stderr,
+                "[virtual-ftps] resolve %s:%u failed: %s\n",
+                host.c_str(), port, ec.message().c_str());
+            return -1;
+        }
+        tcp::socket sock(io);
+        asio::connect(sock, endpoints, ec);
+        if (ec) {
+            std::fprintf(stderr,
+                "[virtual-ftps] connect %s:%u failed: %s\n",
+                host.c_str(), port, ec.message().c_str());
+            return -1;
+        }
+        auto native = sock.native_handle();
+        error_code rel_ec;
+        sock.release(rel_ec);
+        return static_cast<int>(native);
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr,
+            "[virtual-ftps] connect %s:%u threw: %s\n",
+            host.c_str(), port, ex.what());
         return -1;
-    int fd = -1;
-    for (auto* a = res; a; a = a->ai_next) {
-        fd = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (fd < 0) continue;
-        if (::connect(fd, a->ai_addr, a->ai_addrlen) == 0) break;
-        ::close(fd);
-        fd = -1;
     }
-    ::freeaddrinfo(res);
-    return fd;
 }
 
 // Tiny TLS wrapper around an fd. Tracks ownership for RAII close.
@@ -75,10 +104,8 @@ struct TlsConn {
     ~TlsConn() { close(); }
 
     bool connect(const std::string& host, uint16_t port) {
-        fd = tcp_connect(host, port);
-        if (fd < 0) {
-            return false;
-        }
+        fd = tcp_connect_asio(host, port);
+        if (fd < 0) return false;
         SSL_CTX* ctx = ensure_ctx();
         if (!ctx) return false;
         ssl = SSL_new(ctx);
@@ -88,6 +115,11 @@ struct TlsConn {
         if (rc != 1) {
             int e = SSL_get_error(ssl, rc);
             unsigned long q = ERR_get_error();
+            std::fprintf(stderr,
+                "[virtual-ftps] SSL_connect %s:%u failed ssl_err=%d "
+                "errno=%d (%s) queue=%s\n",
+                host.c_str(), port, e, errno, std::strerror(errno),
+                q ? ERR_error_string(q, nullptr) : "(empty)");
             return false;
         }
         return true;
@@ -95,7 +127,16 @@ struct TlsConn {
 
     void close() {
         if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); ssl = nullptr; }
-        if (fd >= 0) { ::shutdown(fd, SHUT_RDWR); ::close(fd); fd = -1; }
+        if (fd >= 0) {
+#ifdef _WIN32
+            ::shutdown(fd, SD_BOTH);
+            ::closesocket(fd);
+#else
+            ::shutdown(fd, SHUT_RDWR);
+            ::close(fd);
+#endif
+            fd = -1;
+        }
     }
 
     // Read until we've seen a complete FTP control reply (one or more
@@ -178,6 +219,8 @@ int upload(const UploadParams& p,
 
     std::string r = ctl.read_reply();
     if (reply_code(r) != 220) {
+        std::fprintf(stderr,
+            "[virtual-ftps] unexpected welcome: %s\n", r.c_str());
         return -2;
     }
 
@@ -192,9 +235,13 @@ int upload(const UploadParams& p,
         if (!ctl.write_line("PASS " + p.pass)) return -3;
         r = ctl.read_reply();
         if (reply_code(r) != 230) {
+            std::fprintf(stderr,
+                "[virtual-ftps] PASS rejected: %s\n", r.c_str());
             return -4;
         }
     } else {
+        std::fprintf(stderr,
+            "[virtual-ftps] USER unexpected: %s\n", r.c_str());
         return -4;
     }
 
@@ -202,6 +249,8 @@ int upload(const UploadParams& p,
     if (!ctl.write_line("TYPE I")) return -3;
     r = ctl.read_reply();
     if (reply_code(r) != 200) {
+        std::fprintf(stderr,
+            "[virtual-ftps] TYPE I rejected: %s\n", r.c_str());
         return -5;
     }
 
@@ -209,11 +258,15 @@ int upload(const UploadParams& p,
     if (!ctl.write_line("PASV")) return -3;
     r = ctl.read_reply();
     if (reply_code(r) != 227) {
+        std::fprintf(stderr,
+            "[virtual-ftps] PASV rejected: %s\n", r.c_str());
         return -6;
     }
     std::string  data_ip;
     uint16_t     data_port = 0;
     if (!parse_pasv(r, data_ip, data_port)) {
+        std::fprintf(stderr,
+            "[virtual-ftps] PASV parse failed: %s\n", r.c_str());
         return -7;
     }
     // Many servers return a useless private IP — fall back to the
@@ -232,12 +285,17 @@ int upload(const UploadParams& p,
     r = ctl.read_reply();
     int c = reply_code(r);
     if (c != 150 && c != 125) {
+        std::fprintf(stderr,
+            "[virtual-ftps] STOR rejected: %s\n", r.c_str());
         return -10;
     }
 
     // --- 4. Stream the file ---------------------------------------------
     std::ifstream f(p.local_path, std::ios::binary);
     if (!f) {
+        std::fprintf(stderr,
+            "[virtual-ftps] cannot open %s: %s\n",
+            p.local_path.c_str(), std::strerror(errno));
         return -11;
     }
     f.seekg(0, std::ios::end);
@@ -256,6 +314,9 @@ int upload(const UploadParams& p,
             int n = SSL_write(data.ssl, chunk.data() + off,
                               static_cast<int>(got - off));
             if (n <= 0) {
+                std::fprintf(stderr,
+                    "[virtual-ftps] data SSL_write failed at %zu/%zu\n",
+                    sent + off, total);
                 data.close();
                 return -12;
             }
@@ -274,6 +335,9 @@ int upload(const UploadParams& p,
     r = ctl.read_reply();
     c = reply_code(r);
     if (c != 226 && c != 250) {
+        std::fprintf(stderr,
+            "[virtual-ftps] STOR final reply unexpected: %s\n",
+            r.c_str());
         return -13;
     }
 
