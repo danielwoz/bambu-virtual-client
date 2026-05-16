@@ -1,30 +1,48 @@
 // VirtualBambuTunnel implementation. See header for design.
+//
+// Networking: boost::asio for TCP + DNS resolve. TLS: raw OpenSSL
+// (TLS 1.2, verify=false) on top of the asio socket's native_handle().
+// We release() the asio socket so the SSL object owns the fd lifetime;
+// SSL_read/SSL_write and the non-blocking select() probe on the
+// underlying fd continue to work unchanged on POSIX, and route to
+// Winsock equivalents on Windows.
 
 #include "VirtualBambuTunnel.hpp"
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <boost/asio.hpp>
+#include <boost/system/error_code.hpp>
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#else
+#  include <sys/select.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+#endif
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace Slic3r {
 namespace virtual_tunnel {
 
 namespace {
+
+namespace asio = boost::asio;
+using asio::ip::tcp;
+using boost::system::error_code;
 
 // A pending sample held until the next ReadSample. We own the buffer for
 // the caller (PrinterFileSystem::HandleResponse keeps the pointer until
@@ -127,24 +145,52 @@ bool parse_virtual_url(const char* url, VirtualTunnel* t) {
     return true;
 }
 
+// Cross-platform fd close. The fd we manage was obtained via
+// tcp::socket::release(), so it owns the system socket — close it the
+// way the platform expects.
+inline void close_fd(int fd) {
+    if (fd < 0) return;
+#ifdef _WIN32
+    ::closesocket(fd);
+#else
+    ::close(fd);
+#endif
+}
+
+inline void shutdown_fd(int fd) {
+    if (fd < 0) return;
+#ifdef _WIN32
+    ::shutdown(fd, SD_BOTH);
+#else
+    ::shutdown(fd, SHUT_RDWR);
+#endif
+}
+
+inline void sleep_ms(int ms) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
+// Open a TCP socket to host:port via boost::asio. Returns the released
+// native socket fd, or -1 on failure. The asio socket is release()d so
+// the fd's lifetime is owned by the caller (handed to OpenSSL via
+// SSL_set_fd). Synchronous — runs on the caller's thread.
 int tcp_connect(const std::string& host, uint16_t port) {
-    addrinfo hints{};
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    const std::string port_str = std::to_string(port);
-    if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0)
+    try {
+        asio::io_context io;
+        tcp::resolver resolver(io);
+        error_code ec;
+        auto endpoints = resolver.resolve(host, std::to_string(port), ec);
+        if (ec) return -1;
+        tcp::socket sock(io);
+        asio::connect(sock, endpoints, ec);
+        if (ec) return -1;
+        auto native = sock.native_handle();
+        error_code rel_ec;
+        sock.release(rel_ec);
+        return static_cast<int>(native);
+    } catch (const std::exception&) {
         return -1;
-    int fd = -1;
-    for (auto* a = res; a; a = a->ai_next) {
-        fd = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (fd < 0) continue;
-        if (::connect(fd, a->ai_addr, a->ai_addrlen) == 0) break;
-        ::close(fd);
-        fd = -1;
     }
-    ::freeaddrinfo(res);
-    return fd;
 }
 
 // Try to read ONE complete frame from `ssl` into `out`. Returns:
@@ -283,12 +329,12 @@ int Bambu_Open_virtual(Bambu_Tunnel tunnel) {
         return -1;
     }
     SSL* ssl = SSL_new(ctx);
-    if (!ssl) { ::close(fd); return -1; }
+    if (!ssl) { close_fd(fd); return -1; }
     SSL_set_fd(ssl, fd);
     const int conn_rc = SSL_connect(ssl);
     if (conn_rc != 1) {
         SSL_free(ssl);
-        ::close(fd);
+        close_fd(fd);
         return -1;
     }
 
@@ -387,7 +433,7 @@ int Bambu_ReadSample_virtual(Bambu_Tunnel tunnel, Bambu_Sample* sample) {
             // No data right now. Tiny sleep so we don't spin the
             // slicer's worker thread (the outer loop's would_block
             // path will further sleep up to 1000 ms).
-            ::usleep(20 * 1000);
+            sleep_ms(20);
             return Bambu_would_block;
         }
         if (got < 0) return Bambu_stream_end;
@@ -414,7 +460,7 @@ int Bambu_ReadSample_virtual(Bambu_Tunnel tunnel, Bambu_Sample* sample) {
             t->read_payload.data() + t->read_payload_got,
             static_cast<int>(t->read_payload_n - t->read_payload_got));
         if (got == 0) {
-            ::usleep(20 * 1000);
+            sleep_ms(20);
             return Bambu_would_block;
         }
         if (got < 0) return Bambu_stream_end;
@@ -447,8 +493,8 @@ void Bambu_Close_virtual(Bambu_Tunnel tunnel) {
         t->ssl = nullptr;
     }
     if (t->fd >= 0) {
-        ::shutdown(t->fd, SHUT_RDWR);
-        ::close(t->fd);
+        shutdown_fd(t->fd);
+        close_fd(t->fd);
         t->fd = -1;
     }
 }
