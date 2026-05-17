@@ -58,6 +58,13 @@ endif()
 # ---- Source list -----------------------------------------------------------
 
 # Always-buildable (no slicer dependency).
+#
+# VirtualLanPrinterStore.cpp soft-depends on libslic3r/Utils.hpp via
+# __has_include — when the slicer headers are on the include path the
+# default ctor resolves the path through Slic3r::data_dir() exactly as
+# before; standalone builds (no slicer headers) require the caller to
+# supply a path via the ctor or in_dir() factory. Either way the TU
+# itself always compiles, so the file lives in _bvc_sources_core.
 set(_bvc_sources_core
     MqttFraming.cpp
     MqttFraming.hpp
@@ -65,14 +72,14 @@ set(_bvc_sources_core
     VirtualMqttClient.hpp
     VirtualFtpsClient.cpp
     VirtualFtpsClient.hpp
+    VirtualLanPrinterStore.cpp
+    VirtualLanPrinterStore.hpp
 )
 
 # Translation units that need slicer-supplied headers.
 set(_bvc_sources_slicer
     VirtualBambuTunnel.cpp
     VirtualBambuTunnel.hpp
-    VirtualLanPrinterStore.cpp
-    VirtualLanPrinterStore.hpp
     VirtualSsdpDiscovery.cpp
     VirtualSsdpDiscovery.hpp
 )
@@ -156,4 +163,25 @@ option(BAMBU_VIRTUAL_CLIENT_BUILD_CLI
 if(BAMBU_VIRTUAL_CLIENT_BUILD_CLI)
     add_executable(bambu_virtual_cli VirtualMqttCli.cpp)
     target_link_libraries(bambu_virtual_cli PRIVATE bambu_virtual_client)
+endif()
+
+# ---- Tests -----------------------------------------------------------------
+#
+# Default ON when built standalone (PROJECT_IS_TOP_LEVEL), OFF when consumed
+# as a subdirectory by a slicer — keeps the slicer build clean of test
+# binaries and ctest registrations.
+if(NOT DEFINED BAMBU_VIRTUAL_CLIENT_BUILD_TESTS)
+    if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+        set(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS_DEFAULT ON)
+    else()
+        set(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS_DEFAULT OFF)
+    endif()
+endif()
+option(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS
+       "Build bambu_virtual_client unit + loopback tests"
+       ${BAMBU_VIRTUAL_CLIENT_BUILD_TESTS_DEFAULT})
+
+if(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
 endif()
