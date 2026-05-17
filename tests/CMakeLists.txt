@@ -23,3 +23,24 @@ set_target_properties(MqttFramingTest PROPERTIES
     CXX_STANDARD_REQUIRED ON
 )
 add_test(NAME MqttFramingTest COMMAND MqttFramingTest)
+
+# Phase 1b — TLS/MQTT loopback against a hermetic in-test broker. Links
+# OpenSSL directly: the test mints its own self-signed cert + runs
+# TLS_server_method, neither of which the library proper needs.
+add_executable(VirtualMqttClientLoopbackTest VirtualMqttClientLoopbackTest.cpp)
+target_link_libraries(VirtualMqttClientLoopbackTest
+    PRIVATE
+        bambu_virtual_client
+        OpenSSL::SSL
+        OpenSSL::Crypto
+)
+set_target_properties(VirtualMqttClientLoopbackTest PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+add_test(NAME VirtualMqttClientLoopbackTest
+         COMMAND VirtualMqttClientLoopbackTest)
+# Honour ctest skip code 77 as a non-failure.
+set_tests_properties(VirtualMqttClientLoopbackTest PROPERTIES
+    SKIP_RETURN_CODE 77
+)
