@@ -14,6 +14,11 @@
 # Phase 1d: VirtualLanPrinterStorePersistTest — persist/hydrate round-trip via
 #                                            in_dir() factory against per-test
 #                                            /tmp dirs.
+# Phase 1e: VirtualFtpsClientLoopbackTest  — implicit-TLS FTPS loopback upload
+#                                            against an in-test minimal FTPS
+#                                            server (USER/PASS, PASV, STOR,
+#                                            QUIT). Skips with ctest 77 on
+#                                            loopback bind failure.
 #
 # All tests follow the BambuStudio-bridge tests/bridge/ convention:
 # no third-party framework, a single int main() that increments a fail
@@ -94,3 +99,21 @@ set_target_properties(VirtualLanPrinterStorePersistTest PROPERTIES
 )
 add_test(NAME VirtualLanPrinterStorePersistTest
          COMMAND VirtualLanPrinterStorePersistTest)
+
+# Phase 1e — implicit-TLS FTPS loopback. Links OpenSSL directly: the test
+# spins its own self-signed TLS FTPS server on 127.0.0.1:random.
+add_executable(VirtualFtpsClientLoopbackTest VirtualFtpsClientLoopbackTest.cpp)
+target_link_libraries(VirtualFtpsClientLoopbackTest
+    PRIVATE
+        bambu_virtual_client
+        OpenSSL::SSL
+        OpenSSL::Crypto
+)
+set_target_properties(VirtualFtpsClientLoopbackTest PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+add_test(NAME VirtualFtpsClientLoopbackTest COMMAND VirtualFtpsClientLoopbackTest)
+set_tests_properties(VirtualFtpsClientLoopbackTest PROPERTIES
+    SKIP_RETURN_CODE 77
+)
