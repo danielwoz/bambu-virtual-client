@@ -29,9 +29,12 @@
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
 #else
+#  include <signal.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
 #endif
+
+#include <mutex>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -172,6 +175,32 @@ inline void sleep_ms(int ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
+#ifndef _WIN32
+// OpenSSL's SSL_write ultimately calls ::send/::write on the underlying
+// fd. When the peer has already closed (the broker half-closes mid-
+// teardown), the kernel raises SIGPIPE on the writer. We never pass
+// MSG_NOSIGNAL (SSL_write doesn't expose send-flags), so an unprepared
+// host application gets killed.
+//
+// Fix: install SIG_IGN for SIGPIPE on first connect, but only if the
+// current handler is still SIG_DFL — never clobber a user-installed
+// handler. Uses sigaction(2), not signal(2), to avoid the latter's
+// buggy POSIX semantics around SA_RESTART.
+inline void install_sigpipe_ignore_once() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        struct sigaction current{};
+        if (sigaction(SIGPIPE, nullptr, &current) == 0 &&
+            current.sa_handler == SIG_DFL) {
+            struct sigaction sa{};
+            sa.sa_handler = SIG_IGN;
+            sigemptyset(&sa.sa_mask);
+            sigaction(SIGPIPE, &sa, nullptr);
+        }
+    });
+}
+#endif
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -265,6 +294,14 @@ void VirtualMqttClient::set_port_resolver(PortResolverFn fn) {
 int VirtualMqttClient::connect_printer(std::string dev_id,
                                        std::string host,
                                        std::string access_code) {
+#ifndef _WIN32
+    // SSL_write paths in this client can raise SIGPIPE when the broker
+    // half-closes mid-teardown. Ignore SIGPIPE process-wide on first
+    // connect (but only if the host hasn't already installed its own
+    // handler).
+    install_sigpipe_ignore_once();
+#endif
+
     PortResolverFn resolver;
     {
         std::lock_guard<std::mutex> lk(m_mu);
