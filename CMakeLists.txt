@@ -24,6 +24,11 @@
 #       <nlohmann/json.hpp>
 #   - BAMBU_VIRTUAL_CLIENT_BOOST_INCLUDE_DIR     -> include dir for boost
 #       headers (often already supplied via target_link_libraries(Boost::*))
+#   - BAMBU_VIRTUAL_CLIENT_WX_INCLUDE_DIRS       -> wxWidgets include dirs
+#       (typically ${wxWidgets_INCLUDE_DIRS} after find_package(wxWidgets)).
+#       VirtualSsdpDiscovery.cpp transitively includes slicer headers that
+#       pull in <wx/setup.h>; without this var the build fails on Windows
+#       and on any host where wx isn't on the default include path.
 #
 # When all three slicer-side variables resolve to non-empty paths the full
 # library (8 translation units) is built. Otherwise only the slicer-agnostic
@@ -112,6 +117,15 @@ if(_bvc_have_slicer)
         ${BAMBU_VIRTUAL_CLIENT_SLICER_SRC_DIR}
         ${BAMBU_VIRTUAL_CLIENT_SLIC3R_INCLUDE_DIR}/GUI/Printer
     )
+    # wxWidgets include dirs: VirtualSsdpDiscovery.cpp uses wxGetApp() /
+    # CallAfter(), and slicer headers it pulls in transitively #include
+    # <wx/setup.h>. Required on Windows (where wx isn't on the default
+    # include path) and any host that didn't already add wx headers
+    # globally.
+    if(BAMBU_VIRTUAL_CLIENT_WX_INCLUDE_DIRS)
+        target_include_directories(bambu_virtual_client SYSTEM PUBLIC
+            ${BAMBU_VIRTUAL_CLIENT_WX_INCLUDE_DIRS})
+    endif()
     # Extra include dirs (typically the generated header tree under
     # ${CMAKE_BINARY_DIR}/src/libslic3r/, ${CMAKE_BINARY_DIR}/src/slic3r/)
     if(BAMBU_VIRTUAL_CLIENT_EXTRA_INCLUDE_DIRS)

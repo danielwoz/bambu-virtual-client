@@ -10,6 +10,7 @@
 #include "VirtualBambuTunnel.hpp"
 
 #include <boost/asio.hpp>
+#include <boost/nowide/convert.hpp>
 #include <boost/system/error_code.hpp>
 
 #ifdef _WIN32
@@ -104,8 +105,19 @@ struct VirtualTunnel {
 
 namespace {
 
+// BambuTunnel.h's Logger callback uses `tchar const* msg`, where
+// `tchar` is `char` on POSIX and `wchar_t` on Windows (UNICODE-on).
+// All call sites here pass UTF-8 `const char*`, so widen on Windows
+// before dispatching to keep the wire-level signature exactly what
+// BambuTunnel.h declares.
 void vlog(VirtualTunnel* t, int level, const char* msg) {
-    if (t && t->logger) t->logger(t->logger_ctx, level, msg);
+    if (!t || !t->logger) return;
+#ifdef _WIN32
+    const std::wstring wmsg = boost::nowide::widen(msg ? msg : "");
+    t->logger(t->logger_ctx, level, wmsg.c_str());
+#else
+    t->logger(t->logger_ctx, level, msg);
+#endif
 }
 
 // Parse host/port/dev_id/access_code out of a URL of the form
