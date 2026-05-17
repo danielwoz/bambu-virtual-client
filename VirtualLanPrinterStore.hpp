@@ -48,6 +48,12 @@ public:
     // mainly for unit tests.
     explicit VirtualLanPrinterStore(std::string path = {});
 
+    // Build a store that lives at <data_dir>/virtual_lan_printers.json
+    // without consulting Slic3r::data_dir(). Lets the standalone build
+    // (which has no libslic3r) and unit tests pick a directory without
+    // having to hard-code the filename.
+    static VirtualLanPrinterStore in_dir(const std::string& data_dir);
+
     // Returns the persisted entries; empty vector if the file doesn't
     // exist or is malformed. Never throws — logs malformed lines via
     // BOOST_LOG_TRIVIAL and returns whatever was parseable.

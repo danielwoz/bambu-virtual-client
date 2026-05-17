@@ -62,9 +62,14 @@ endif()
 # VirtualSsdpAliveJson.{hpp,cpp} is the pure JSON builder split out of
 # VirtualSsdpDiscovery so the schema contract (the keys
 # DeviceManager::on_machine_alive parses) can be pinned by a standalone
-# test without dragging slicer headers in. It depends on nlohmann/json;
-# auto-detect the header below if the consuming project didn't supply
-# BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR.
+# test without dragging slicer headers in. Depends on nlohmann/json.
+#
+# VirtualLanPrinterStore.cpp soft-depends on libslic3r/Utils.hpp via
+# __has_include — when the slicer headers are on the include path the
+# default ctor resolves the path through Slic3r::data_dir() exactly as
+# before; standalone builds (no slicer headers) require the caller to
+# supply a path via the ctor or in_dir() factory. Either way the TU
+# itself always compiles, so the file lives in _bvc_sources_core.
 set(_bvc_sources_core
     MqttFraming.cpp
     MqttFraming.hpp
@@ -74,6 +79,8 @@ set(_bvc_sources_core
     VirtualFtpsClient.hpp
     VirtualSsdpAliveJson.cpp
     VirtualSsdpAliveJson.hpp
+    VirtualLanPrinterStore.cpp
+    VirtualLanPrinterStore.hpp
 )
 
 # nlohmann/json auto-detection — only kicks in when the consumer didn't
@@ -95,8 +102,6 @@ endif()
 set(_bvc_sources_slicer
     VirtualBambuTunnel.cpp
     VirtualBambuTunnel.hpp
-    VirtualLanPrinterStore.cpp
-    VirtualLanPrinterStore.hpp
     VirtualSsdpDiscovery.cpp
     VirtualSsdpDiscovery.hpp
 )
@@ -184,9 +189,15 @@ endif()
 
 # ---- Tests -----------------------------------------------------------------
 #
+<<<<<<< HEAD
 # Default ON when built standalone (the project is the top-level CMake
 # project), OFF when consumed as a subdirectory by a slicer — keeps the
 # slicer build clean of test binaries and ctest registrations.
+=======
+# Default ON when built standalone (PROJECT_IS_TOP_LEVEL), OFF when consumed
+# as a subdirectory by a slicer — keeps the slicer build clean of test
+# binaries and ctest registrations.
+>>>>>>> phase1d-lanstore-persist
 if(NOT DEFINED BAMBU_VIRTUAL_CLIENT_BUILD_TESTS)
     if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
         set(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS_DEFAULT ON)
@@ -195,7 +206,11 @@ if(NOT DEFINED BAMBU_VIRTUAL_CLIENT_BUILD_TESTS)
     endif()
 endif()
 option(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS
+<<<<<<< HEAD
        "Build bambu_virtual_client unit + loopback + contract tests"
+=======
+       "Build bambu_virtual_client unit + loopback tests"
+>>>>>>> phase1d-lanstore-persist
        ${BAMBU_VIRTUAL_CLIENT_BUILD_TESTS_DEFAULT})
 
 if(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS)

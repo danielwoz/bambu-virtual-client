@@ -1,11 +1,33 @@
 #include "VirtualLanPrinterStore.hpp"
 
-#include "libslic3r/Utils.hpp"
+// libslic3r/Utils.hpp brings in Slic3r::data_dir() — the default path
+// resolver. When this TU is built standalone (no slicer headers on the
+// include path) callers must supply an explicit path via the ctor or
+// the in_dir() factory; tests do exactly that. __has_include keeps the
+// existing slicer build behaviour-preserving.
+#if __has_include("libslic3r/Utils.hpp")
+#  include "libslic3r/Utils.hpp"
+#  define BAMBU_VIRTUAL_CLIENT_HAS_SLIC3R_DATADIR 1
+#endif
 
 #include <boost/filesystem.hpp>
-#include <boost/log/trivial.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
+
+// Boost.Log is not header-only — it requires linking libboost_log,
+// which the slicer build provides but the standalone client build
+// doesn't (boost_log isn't on slim Debian/Ubuntu hosts). Gate the
+// include on the same flag we use for libslic3r, and route diagnostics
+// through std::cerr in the standalone build so the TU stays linkable.
+#ifdef BAMBU_VIRTUAL_CLIENT_HAS_SLIC3R_DATADIR
+#  include <boost/log/trivial.hpp>
+#  define BVC_LAN_LOG_WARN  BOOST_LOG_TRIVIAL(warning)
+#  define BVC_LAN_LOG_ERROR BOOST_LOG_TRIVIAL(error)
+#else
+#  include <iostream>
+#  define BVC_LAN_LOG_WARN  std::cerr << "[warn] "
+#  define BVC_LAN_LOG_ERROR std::cerr << "[error] "
+#endif
 
 #include <fstream>
 #include <sstream>
@@ -19,12 +41,26 @@ constexpr int         kSchemaVersion   = 1;
 
 VirtualLanPrinterStore::VirtualLanPrinterStore(std::string path) {
     if (path.empty()) {
+#ifdef BAMBU_VIRTUAL_CLIENT_HAS_SLIC3R_DATADIR
         boost::filesystem::path p(Slic3r::data_dir());
         p /= kDefaultFilename;
         m_path = p.string();
+#else
+        // Standalone build (no slicer headers): caller must supply a
+        // path explicitly via the ctor or in_dir(). Leave m_path empty;
+        // load()/save() will treat the file as missing.
+        m_path.clear();
+#endif
     } else {
         m_path = std::move(path);
     }
+}
+
+VirtualLanPrinterStore
+VirtualLanPrinterStore::in_dir(const std::string& data_dir) {
+    boost::filesystem::path p(data_dir);
+    p /= kDefaultFilename;
+    return VirtualLanPrinterStore(p.string());
 }
 
 std::vector<VirtualLanPrinterStore::Entry>
@@ -36,7 +72,7 @@ VirtualLanPrinterStore::load() const {
     try {
         boost::property_tree::read_json(m_path, root);
     } catch (const std::exception& ex) {
-        BOOST_LOG_TRIVIAL(warning)
+        BVC_LAN_LOG_WARN
             << "VirtualLanPrinterStore: parse '" << m_path
             << "' failed: " << ex.what();
         return out;
@@ -55,7 +91,7 @@ VirtualLanPrinterStore::load() const {
         e.printer_type = node.get<std::string>("printer_type", "");
         e.mqtt_port    = node.get<uint16_t>   ("mqtt_port",    0);
         if (e.dev_id.empty()) {
-            BOOST_LOG_TRIVIAL(warning)
+            BVC_LAN_LOG_WARN
                 << "VirtualLanPrinterStore: skipping entry without dev_id";
             continue;
         }
@@ -90,7 +126,7 @@ bool VirtualLanPrinterStore::save(const std::vector<Entry>& entries) const {
         {
             std::ofstream os(tmp_path.string());
             if (!os) {
-                BOOST_LOG_TRIVIAL(error)
+                BVC_LAN_LOG_ERROR
                     << "VirtualLanPrinterStore: can't open " << tmp_path;
                 return false;
             }
@@ -98,7 +134,7 @@ bool VirtualLanPrinterStore::save(const std::vector<Entry>& entries) const {
         }
         boost::filesystem::rename(tmp_path, final_path);
     } catch (const std::exception& ex) {
-        BOOST_LOG_TRIVIAL(error)
+        BVC_LAN_LOG_ERROR
             << "VirtualLanPrinterStore: save '" << m_path
             << "' failed: " << ex.what();
         boost::system::error_code ec;
