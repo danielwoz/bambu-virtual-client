@@ -1,0 +1,79 @@
+# GitHub Actions CI for bambu-virtual-client.
+#
+# Builds the standalone (slicer-agnostic) subset of the library and runs
+# every Phase 1 ctest in the build tree. The CLI testbed isn't needed for
+# CI, so it's switched off via -DBAMBU_VIRTUAL_CLIENT_BUILD_CLI=OFF.
+#
+# Slicer-coupled translation units (VirtualBambuTunnel, VirtualLanPrinterStore,
+# VirtualSsdpDiscovery) are silently skipped when the SLIC3R / SLICER_SRC /
+# JSON_INCLUDE_DIR variables are not set — see the root CMakeLists.txt for
+# the gating logic. CI exercises only the always-buildable subset.
+
+name: CI
+
+"on":
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: Build + ctest (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # This repo *is* the submodule consumed by the slicers; there are
+          # no nested submodules of our own to fetch.
+          submodules: false
+
+      - name: Install build dependencies
+        # cmake / build-essential   -> compiler + cmake
+        # libssl-dev                -> OpenSSL::SSL, OpenSSL::Crypto
+        # libboost-{filesystem,log,system}-dev + headers
+        #                           -> boost::asio (header-only), boost::log,
+        #                              boost::filesystem, boost::algorithm,
+        #                              boost::property_tree
+        # nlohmann-json3-dev        -> <nlohmann/json.hpp>; not strictly
+        #                              required for the slicer-agnostic
+        #                              subset today but cheap to install and
+        #                              future-proofs Phase 1c tests if they
+        #                              link to the JSON helpers.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            build-essential \
+            libssl-dev \
+            libboost-filesystem-dev \
+            libboost-log-dev \
+            libboost-system-dev \
+            libboost-dev \
+            nlohmann-json3-dev
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBAMBU_VIRTUAL_CLIENT_BUILD_TESTS=ON \
+            -DBAMBU_VIRTUAL_CLIENT_BUILD_CLI=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        # Verbose output so a failing test's stderr is captured in the run
+        # log without needing to download the artifact below. CTest treats
+        # exit code 77 as "skip" by default, so optional / environment-gated
+        # tests don't fail the job.
+        run: ctest --test-dir build --output-on-failure -V
+
+      - name: Upload LastTest.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-LastTest-log
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
