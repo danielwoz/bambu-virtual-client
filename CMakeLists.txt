@@ -58,6 +58,13 @@ endif()
 # ---- Source list -----------------------------------------------------------
 
 # Always-buildable (no slicer dependency).
+#
+# VirtualSsdpAliveJson.{hpp,cpp} is the pure JSON builder split out of
+# VirtualSsdpDiscovery so the schema contract (the keys
+# DeviceManager::on_machine_alive parses) can be pinned by a standalone
+# test without dragging slicer headers in. It depends on nlohmann/json;
+# auto-detect the header below if the consuming project didn't supply
+# BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR.
 set(_bvc_sources_core
     MqttFraming.cpp
     MqttFraming.hpp
@@ -65,7 +72,24 @@ set(_bvc_sources_core
     VirtualMqttClient.hpp
     VirtualFtpsClient.cpp
     VirtualFtpsClient.hpp
+    VirtualSsdpAliveJson.cpp
+    VirtualSsdpAliveJson.hpp
 )
+
+# nlohmann/json auto-detection — only kicks in when the consumer didn't
+# already point us at a copy. Lets `cmake -S . -B build` "just work" on a
+# vanilla checkout for the standalone-test path.
+if(NOT BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR)
+    find_path(BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR
+              NAMES nlohmann/json.hpp)
+endif()
+if(NOT BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR)
+    message(FATAL_ERROR
+        "bambu_virtual_client: nlohmann/json.hpp not found. Set "
+        "BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR to the include dir "
+        "containing <nlohmann/json.hpp> (the slicer build supplies this "
+        "automatically).")
+endif()
 
 # Translation units that need slicer-supplied headers.
 set(_bvc_sources_slicer
@@ -160,9 +184,9 @@ endif()
 
 # ---- Tests -----------------------------------------------------------------
 #
-# Default ON when built standalone (PROJECT_IS_TOP_LEVEL), OFF when consumed
-# as a subdirectory by a slicer — keeps the slicer build clean of test
-# binaries and ctest registrations.
+# Default ON when built standalone (the project is the top-level CMake
+# project), OFF when consumed as a subdirectory by a slicer — keeps the
+# slicer build clean of test binaries and ctest registrations.
 if(NOT DEFINED BAMBU_VIRTUAL_CLIENT_BUILD_TESTS)
     if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
         set(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS_DEFAULT ON)
@@ -171,7 +195,7 @@ if(NOT DEFINED BAMBU_VIRTUAL_CLIENT_BUILD_TESTS)
     endif()
 endif()
 option(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS
-       "Build bambu_virtual_client unit + loopback tests"
+       "Build bambu_virtual_client unit + loopback + contract tests"
        ${BAMBU_VIRTUAL_CLIENT_BUILD_TESTS_DEFAULT})
 
 if(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS)

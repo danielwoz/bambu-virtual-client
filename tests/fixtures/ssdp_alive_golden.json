@@ -1,0 +1,11 @@
+{
+  "bind_state": "free",
+  "connect_type": "lan",
+  "dev_id": "FFFF1234567890",
+  "dev_ip": "192.168.1.42",
+  "dev_name": "Virtual H2D Lab",
+  "dev_signal": "-50dBm",
+  "dev_type": "H2D",
+  "sec_link": "secure",
+  "ssdp_version": "01.06.00.00"
+}

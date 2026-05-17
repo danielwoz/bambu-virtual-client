@@ -3,6 +3,7 @@
 #include "VirtualSsdpDiscovery.hpp"
 
 #include "VirtualLanPrinterStore.hpp"
+#include "VirtualSsdpAliveJson.hpp"  // pure JSON builder (standalone-testable)
 // Resolved from the consuming slicer's src/slic3r/ include path,
 // supplied to this library by the parent CMake project (see
 // BAMBU_VIRTUAL_CLIENT_SLIC3R_INCLUDE_DIR).
@@ -22,8 +23,6 @@
 #include <sstream>
 #include <string>
 #include <thread>
-
-#include <nlohmann/json.hpp>
 
 namespace Slic3r {
 
@@ -68,38 +67,27 @@ parse_headers(const std::string& payload) {
     return out;
 }
 
-// Build the JSON shape DeviceManager::on_machine_alive expects.
-// `bridge_ip` is the source IP of the UDP packet — that's where MQTT/
-// FTPS/vtun all live for this virtual printer.
-std::string build_alive_json(const std::map<std::string, std::string>& h,
-                             const std::string& bridge_ip) {
+// Translate an SSDP header map + source IP into the plain-data
+// AliveInfo the JSON builder consumes. The JSON shape itself is
+// pinned in VirtualSsdpAliveJson.cpp so the contract test can exercise
+// it without dragging slicer headers in.
+AliveInfo alive_info_from_headers(const std::map<std::string, std::string>& h,
+                                  const std::string& bridge_ip) {
     auto get = [&](const char* k) -> std::string {
         auto it = h.find(k);
         return it == h.end() ? std::string() : it->second;
     };
-
-    nlohmann::json j;
-    j["dev_name"]     = get("devname.bambu.com");
-    j["dev_id"]       = get("usn");
-    j["dev_ip"]       = bridge_ip;
-    j["dev_type"]     = get("devmodel.bambu.com");
-    j["dev_signal"]   = get("devsignal.bambu.com");
-    // FFFF entries live on a LAN — the bridge IS the LAN endpoint. We
-    // skip the cloud path entirely.
-    j["connect_type"] = "lan";
-    // DevBind: "free" / "occupied" — pass through; default to free so
-    // the slicer's Add-Printer flow shows the bind button.
-    {
-        std::string bind = get("devbind.bambu.com");
-        if (bind.empty()) bind = "free";
-        j["bind_state"] = bind;
-    }
-    // Optional fields DeviceManager reads only if present.
-    if (!get("devseclink.bambu.com").empty())
-        j["sec_link"] = get("devseclink.bambu.com");
-    if (!get("devversion.bambu.com").empty())
-        j["ssdp_version"] = get("devversion.bambu.com");
-    return j.dump();
+    AliveInfo info;
+    info.dev_name     = get("devname.bambu.com");
+    info.dev_id       = get("usn");
+    info.dev_ip       = bridge_ip;
+    info.dev_type     = get("devmodel.bambu.com");
+    info.dev_signal   = get("devsignal.bambu.com");
+    info.bind_state   = get("devbind.bambu.com");      // builder defaults empty→"free"
+    info.sec_link     = get("devseclink.bambu.com");
+    info.ssdp_version = get("devversion.bambu.com");
+    // connect_type is left empty; builder defaults it to "lan".
+    return info;
 }
 
 // Parse the host:port out of an SSDP LOCATION header. Bambu printers
@@ -212,7 +200,8 @@ struct VirtualSsdpDiscovery::Impl {
         const std::string bridge_ip = from.address().to_string();
 
         // Build the alive JSON for DeviceManager.
-        const std::string alive_json = build_alive_json(headers, bridge_ip);
+        const std::string alive_json =
+            build_alive_json(alive_info_from_headers(headers, bridge_ip));
 
         // Dedupe: hash dev_id|ip|name|version → only update store when
         // something meaningful changes.
@@ -305,15 +294,14 @@ struct VirtualSsdpDiscovery::Impl {
         for (const auto& e : rows) {
             // Build an alive JSON from the persisted record so the
             // device list shows up before any SSDP traffic arrives.
-            nlohmann::json j;
-            j["dev_name"]     = e.dev_name;
-            j["dev_id"]       = e.dev_id;
-            j["dev_ip"]       = e.lan_ip;
-            j["dev_type"]     = e.printer_type;
-            j["dev_signal"]   = "";
-            j["connect_type"] = "lan";
-            j["bind_state"]   = "free";
-            const std::string alive_json = j.dump();
+            AliveInfo info;
+            info.dev_name  = e.dev_name;
+            info.dev_id    = e.dev_id;
+            info.dev_ip    = e.lan_ip;
+            info.dev_type  = e.printer_type;
+            // dev_signal/connect_type/bind_state left empty: builder
+            // defaults connect_type→"lan", bind_state→"free".
+            const std::string alive_json = build_alive_json(info);
             try {
                 auto& app = GUI::wxGetApp();
                 app.CallAfter([alive_json]() {
