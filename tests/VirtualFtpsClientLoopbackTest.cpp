@@ -734,26 +734,17 @@ int main() {
 
     // ----- 6. 100 KiB upload, byte-equality on server side. -----------------
     //
-    // NOTE (bug found, not fixed): on loopback, VirtualFtpsClient's data
-    // teardown drops the tail of the payload. The client's TlsConn::close
-    // does SSL_shutdown (sends close_notify) but does NOT wait for the
-    // peer's close_notify, then immediately calls shutdown(SHUT_RDWR) +
-    // close(). If the receiver hasn't fully drained its kernel receive
-    // buffer at that moment, Linux replies with TCP RST, purging the
-    // remaining buffered bytes on the receiving side. Reproduces here as
-    // ~50-65 KiB delivered out of 100 KiB, with the client still happily
-    // returning 0 because the control channel got its "226 Transfer
-    // complete" reply (the server's STOR handler sends 226 the moment
-    // the data thread exits its SSL_read loop, which is the wrong order
-    // when the loop exits via RST — but that's a server-side artefact
-    // for this test stand-in; the real bug is the client's aggressive
-    // teardown). Production may mask this if the server reads as fast as
-    // the client writes (kernel never accumulates unread bytes), but a
-    // slow or back-pressured receiver will lose tail bytes.
-    //
-    // We attempt the upload and assert it doesn't crash, with a soft
-    // byte-equality check that documents the truncation rather than
-    // failing the test. Task spec is explicit: don't change the client.
+    // Regression coverage for the TLS-shutdown bug surfaced by Phase 1e:
+    // VirtualFtpsClient::TlsConn::close() used to call SSL_shutdown once
+    // (sending close_notify) and then immediately shutdown(SHUT_RDWR) +
+    // close() on the fd, without waiting for the peer's close_notify. On
+    // Linux loopback, unread bytes in the kernel receive buffer caused
+    // TCP RST, which purged the tail of the upload on the server side
+    // (~50-65 KiB delivered out of 100 KiB) while the client returned 0
+    // because the control channel had already seen "226 Transfer
+    // complete". The fix performs a proper bidirectional SSL shutdown
+    // bounded by a 2 s socket timeout. With that fix in place this
+    // subtest hard-asserts the full payload arrives.
     {
         FtpServerOptions opt;
         opt.expected_user = "bblp";
@@ -799,9 +790,9 @@ int main() {
                                     payload.begin());
         check(prefix_ok,
               "bytes that did arrive are a correct prefix of payload");
-        // Document the truncation symptom without failing the test.
-        softcheck(r.received_bytes.size() == payload.size(),
-                  "(known client bug) full 100 KiB delivered");
+        // With the TLS shutdown fix this is now reliable on loopback.
+        check(r.received_bytes.size() == payload.size(),
+              "full 100 KiB delivered");
 
         srv.stop();
         std::filesystem::remove(file);

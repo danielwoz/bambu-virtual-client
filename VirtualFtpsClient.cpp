@@ -126,7 +126,40 @@ struct TlsConn {
     }
 
     void close() {
-        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); ssl = nullptr; }
+        if (ssl) {
+            // Graceful bidirectional TLS shutdown. SSL_shutdown returns:
+            //   1 if both sides have sent close_notify (clean)
+            //   0 if our close_notify is sent but peer's hasn't arrived
+            //   <0 on error (or WANT_READ/WANT_WRITE on non-blocking I/O)
+            //
+            // If we skip the second call, the kernel may still hold unread
+            // bytes in the receive buffer when we close() the fd — Linux
+            // then sends TCP RST, which purges the tail of any in-flight
+            // payload on the peer side. Surface symptom: server gets only
+            // a fraction of an FTPS upload while the client returns OK
+            // because the control channel already saw "226 Transfer
+            // complete". Drain the peer's close_notify (bounded by a
+            // 2-second socket timeout so a misbehaving peer can't hang us)
+            // before tearing down the TCP socket.
+            int r = SSL_shutdown(ssl);
+            if (r == 0 && fd >= 0) {
+#ifdef _WIN32
+                DWORD tv_ms = 2000;
+                ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                             reinterpret_cast<const char*>(&tv_ms),
+                             sizeof(tv_ms));
+#else
+                struct timeval tv{};
+                tv.tv_sec  = 2;
+                tv.tv_usec = 0;
+                ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                             &tv, sizeof(tv));
+#endif
+                SSL_shutdown(ssl);  // ignore return; we tried.
+            }
+            SSL_free(ssl);
+            ssl = nullptr;
+        }
         if (fd >= 0) {
 #ifdef _WIN32
             ::shutdown(fd, SD_BOTH);
