@@ -157,3 +157,24 @@ if(BAMBU_VIRTUAL_CLIENT_BUILD_CLI)
     add_executable(bambu_virtual_cli VirtualMqttCli.cpp)
     target_link_libraries(bambu_virtual_cli PRIVATE bambu_virtual_client)
 endif()
+
+# ---- Tests -----------------------------------------------------------------
+#
+# Default ON when built standalone (PROJECT_IS_TOP_LEVEL), OFF when consumed
+# as a subdirectory by a slicer — keeps the slicer build clean of test
+# binaries and ctest registrations.
+if(NOT DEFINED BAMBU_VIRTUAL_CLIENT_BUILD_TESTS)
+    if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+        set(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS_DEFAULT ON)
+    else()
+        set(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS_DEFAULT OFF)
+    endif()
+endif()
+option(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS
+       "Build bambu_virtual_client unit + loopback tests"
+       ${BAMBU_VIRTUAL_CLIENT_BUILD_TESTS_DEFAULT})
+
+if(BAMBU_VIRTUAL_CLIENT_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
