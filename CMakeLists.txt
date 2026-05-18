@@ -170,6 +170,15 @@ target_link_libraries(bambu_virtual_client
         Threads::Threads
 )
 
+# Defensive Windows-side link list. The slicer's own libs (libcurl,
+# wxWidgets) usually pull ws2_32 + crypt32 in transitively today, so the
+# typical consuming build doesn't need this. But if anyone ever cuts the
+# submodule loose for standalone Windows CI, the link step otherwise
+# fails with unresolved winsock symbols.
+if(WIN32)
+    target_link_libraries(bambu_virtual_client PUBLIC ws2_32 crypt32)
+endif()
+
 if(NOT _bvc_have_slicer)
     message(STATUS "bambu_virtual_client: building slicer-agnostic subset only "
                    "(set BAMBU_VIRTUAL_CLIENT_SLIC3R_INCLUDE_DIR, "

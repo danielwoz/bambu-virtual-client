@@ -11,6 +11,7 @@
 #endif
 
 #include <boost/filesystem.hpp>
+#include <boost/nowide/fstream.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 
@@ -124,7 +125,9 @@ bool VirtualLanPrinterStore::save(const std::vector<Entry>& entries) const {
     try {
         boost::filesystem::create_directories(final_path.parent_path());
         {
-            std::ofstream os(tmp_path.string());
+            // boost::nowide::ofstream takes UTF-8 paths on all platforms;
+            // on Windows it widens internally so non-ASCII data_dir() works.
+            boost::nowide::ofstream os(tmp_path.string());
             if (!os) {
                 BVC_LAN_LOG_ERROR
                     << "VirtualLanPrinterStore: can't open " << tmp_path;

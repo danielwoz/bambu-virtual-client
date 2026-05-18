@@ -69,11 +69,18 @@ void usage(const char* prog) {
 void on_signal(int) { g_stop.store(true); }
 
 void install_signal_handlers() {
+#ifdef _WIN32
+    // Windows has no sigaction; std::signal does what we need (SIGINT only —
+    // there's no SIGTERM equivalent in the CRT, console close fires CTRL_CLOSE_EVENT
+    // which we don't currently hook).
+    std::signal(SIGINT, on_signal);
+#else
     struct sigaction sa{};
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     ::sigaction(SIGINT,  &sa, nullptr);
     ::sigaction(SIGTERM, &sa, nullptr);
+#endif
 }
 
 // Print `payload` to stdout with a max-prefix cap. The full size is

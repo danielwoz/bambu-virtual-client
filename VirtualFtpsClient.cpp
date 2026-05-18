@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <boost/asio.hpp>
+#include <boost/nowide/fstream.hpp>
 #include <boost/system/error_code.hpp>
 
 #ifdef _WIN32
@@ -30,6 +31,9 @@
 #  include <ws2tcpip.h>
 #else
 #  include <sys/socket.h>
+#  include <arpa/inet.h>   // INET_ADDRSTRLEN — boost::asio brings this in
+                            // transitively today but make the dependency explicit
+                            // so an asio version that hides it doesn't break us.
 #endif
 
 #include <openssl/err.h>
@@ -324,7 +328,10 @@ int upload(const UploadParams& p,
     }
 
     // --- 4. Stream the file ---------------------------------------------
-    std::ifstream f(p.local_path, std::ios::binary);
+    // boost::nowide::ifstream accepts UTF-8 paths on Windows (widens internally
+    // before CreateFileW), so users with non-ASCII filenames in their .3mf
+    // paths can still upload.
+    boost::nowide::ifstream f(p.local_path, std::ios::binary);
     if (!f) {
         std::fprintf(stderr,
             "[virtual-ftps] cannot open %s: %s\n",
