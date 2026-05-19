@@ -231,7 +231,16 @@ struct VirtualSsdpDiscovery::Impl {
             e.lan_ip       = bridge_ip;
             e.access_code  = "";   // unknown until user pairs
             e.printer_type = headers["devmodel.bambu.com"];
-            e.mqtt_port    = parse_location_port(headers["location"]);
+            // Explicit Bambu-Mqtt-Port header wins; LOCATION is bare-IP in
+            // the bridge's A1-mimicry mode so parse_location_port returns 0
+            // there. Keep the LOCATION fallback for any future bridge build
+            // that does embed :port (and for unit-test fixtures).
+            try {
+                if (!headers["bambu-mqtt-port"].empty())
+                    e.mqtt_port = static_cast<uint16_t>(std::stoi(headers["bambu-mqtt-port"]));
+            } catch (...) { e.mqtt_port = 0; }
+            if (e.mqtt_port == 0)
+                e.mqtt_port = parse_location_port(headers["location"]);
             store.upsert(e);
         }
 
