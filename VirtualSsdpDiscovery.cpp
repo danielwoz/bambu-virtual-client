@@ -474,4 +474,35 @@ uint16_t VirtualSsdpDiscovery::probe_port(const std::string& bridge_ip,
     return found ? found : advertised_port(dev_id);
 }
 
+uint16_t VirtualSsdpDiscovery::resolve_mqtt_port(const std::string& dev_id,
+                                                 const std::string& bridge_ip_hint) {
+    // 1. live SSDP cache (freshest — set by the running listener)
+    if (uint16_t p = advertised_port(dev_id)) return p;
+    // 2. persisted store; capture lan_ip for the probe fallback
+    std::string ip = bridge_ip_hint;
+    {
+        VirtualLanPrinterStore store;
+        for (const auto& e : store.load()) {
+            if (e.dev_id == dev_id) {
+                if (e.mqtt_port) return e.mqtt_port;
+                if (ip.empty()) ip = e.lan_ip;
+                break;
+            }
+        }
+    }
+    // 3. unicast probe of the bridge host (reliable where multicast is dropped)
+    if (!ip.empty())
+        if (uint16_t p = probe_port(ip, dev_id)) return p;
+    return 0;
+}
+
+uint16_t VirtualSsdpDiscovery::port_for(const std::string& dev_id,
+                                        uint16_t           port_base,
+                                        const std::string& bridge_ip_hint) {
+    constexpr uint16_t kMqttBase = 8883;
+    uint16_t mp = resolve_mqtt_port(dev_id, bridge_ip_hint);
+    if (mp == 0) mp = kMqttBase;   // unknown dev -> index 0 (base port)
+    return static_cast<uint16_t>(int(port_base) + (int(mp) - int(kMqttBase)));
+}
+
 } // namespace Slic3r

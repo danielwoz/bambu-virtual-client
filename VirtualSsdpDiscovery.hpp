@@ -70,6 +70,19 @@ public:
                                const std::string& dev_id,
                                int timeout_ms = 800);
 
+    // One-stop per-printer MQTT-port resolution — the single source of truth
+    // for EVERY virtual-client port derivation (MQTT 8883+i, FTPS 39990+i,
+    // RTSP 38322+i, vtun 39998+i; the bridge assigns the same index `i` to
+    // all four). Chain: live SSDP cache -> persisted store -> unicast probe.
+    // `bridge_ip_hint` is used for the probe; if empty the store's lan_ip is
+    // used. Returns 0 if the dev is unknown (callers fall back to index 0).
+    // Use port_for(dev_id, base, hint) to get the derived per-printer port.
+    static uint16_t resolve_mqtt_port(const std::string& dev_id,
+                                      const std::string& bridge_ip_hint = {});
+    static uint16_t port_for(const std::string& dev_id,
+                             uint16_t           port_base,
+                             const std::string& bridge_ip_hint = {});
+
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
