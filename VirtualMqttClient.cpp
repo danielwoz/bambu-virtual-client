@@ -10,6 +10,7 @@
 #include "VirtualMqttClient.hpp"
 
 #include "MqttFraming.hpp"
+#include "VirtualSsdpDiscovery.hpp"   // unicast port probe for cold-cache connects
 
 #include <array>
 #include <atomic>
@@ -323,7 +324,17 @@ int VirtualMqttClient::connect_printer(std::string dev_id,
     // Bambu LAN MQTT behaviour).
     uint16_t port = 0;
     if (resolver) port = resolver(dev_id);
+    // Resolver came up empty (cold SSDP cache, no persisted port, multicast
+    // SSDP dropped by a host firewall). We DO know `host` — the exact bridge
+    // IP we're about to dial — so probe it directly by UNICAST M-SEARCH for
+    // this dev's advertised Bambu-Mqtt-Port. Reliable where multicast isn't,
+    // and needs no persisted state.
+    if (port == 0) port = VirtualSsdpDiscovery::probe_port(host, dev_id);
     if (port == 0) port = 8883;
+    std::fprintf(stderr,
+        "[virtual-mqtt] connect dev=%s host=%s -> port=%u\n",
+        dev_id.c_str(), host.c_str(), static_cast<unsigned>(port));
+    std::fflush(stderr);
 
     // Try the initial TCP+TLS handshake. If it fails because the bridge
     // isn't listening yet (the common case during slicer startup before
