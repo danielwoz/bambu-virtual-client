@@ -18,8 +18,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -124,6 +127,34 @@ bool is_notify(const std::string& payload) {
            std::strncmp(payload.data(), "NOTIFY ", 7) == 0;
 }
 
+// Process-wide dev_id -> advertised MQTT port cache, shared by the
+// multicast listener and the unicast probe. Feeds the VirtualMqttClient
+// port resolver so per-printer ports resolve with zero manual config.
+std::mutex& port_cache_mu() { static std::mutex m; return m; }
+std::map<std::string, uint16_t>& port_cache() {
+    static std::map<std::string, uint16_t> m;
+    return m;
+}
+void cache_port(const std::string& dev_id, uint16_t port) {
+    if (dev_id.empty() || port == 0) return;
+    std::lock_guard<std::mutex> lk(port_cache_mu());
+    port_cache()[dev_id] = port;
+}
+
+// Extract the advertised MQTT port from a parsed SSDP header map: the
+// explicit `Bambu-Mqtt-Port` header wins; otherwise fall back to a
+// :port embedded in LOCATION (0 if neither is present).
+uint16_t mqtt_port_from_headers(std::map<std::string, std::string>& headers) {
+    uint16_t port = 0;
+    try {
+        if (!headers["bambu-mqtt-port"].empty())
+            port = static_cast<uint16_t>(std::stoi(headers["bambu-mqtt-port"]));
+    } catch (...) { port = 0; }
+    if (port == 0)
+        port = parse_location_port(headers["location"]);
+    return port;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -199,6 +230,13 @@ struct VirtualSsdpDiscovery::Impl {
 
         const std::string bridge_ip = from.address().to_string();
 
+        // Always refresh the live port cache from this advertisement — even
+        // when the store dedupe below decides nothing meaningful changed —
+        // so the VirtualMqttClient port resolver always has the freshest
+        // advertised MQTT port for this dev_id.
+        const uint16_t adv_port = mqtt_port_from_headers(headers);
+        cache_port(usn, adv_port);
+
         // Build the alive JSON for DeviceManager.
         const std::string alive_json =
             build_alive_json(alive_info_from_headers(headers, bridge_ip));
@@ -229,18 +267,17 @@ struct VirtualSsdpDiscovery::Impl {
             e.dev_id       = usn;
             e.dev_name     = headers["devname.bambu.com"];
             e.lan_ip       = bridge_ip;
-            e.access_code  = "";   // unknown until user pairs
             e.printer_type = headers["devmodel.bambu.com"];
-            // Explicit Bambu-Mqtt-Port header wins; LOCATION is bare-IP in
-            // the bridge's A1-mimicry mode so parse_location_port returns 0
-            // there. Keep the LOCATION fallback for any future bridge build
-            // that does embed :port (and for unit-test fixtures).
-            try {
-                if (!headers["bambu-mqtt-port"].empty())
-                    e.mqtt_port = static_cast<uint16_t>(std::stoi(headers["bambu-mqtt-port"]));
-            } catch (...) { e.mqtt_port = 0; }
-            if (e.mqtt_port == 0)
-                e.mqtt_port = parse_location_port(headers["location"]);
+            e.mqtt_port    = adv_port;   // same value cached above
+            // SSDP never carries the LAN access code (a secret the user
+            // pairs once). Preserve any previously-stored code so
+            // re-discovery doesn't wipe it and force re-pairing.
+            e.access_code  = "";
+            for (const auto& prev : store.load())
+                if (prev.dev_id == usn && !prev.access_code.empty()) {
+                    e.access_code = prev.access_code;
+                    break;
+                }
             store.upsert(e);
         }
 
@@ -376,6 +413,65 @@ void VirtualSsdpDiscovery::stop() {
     m_impl->io.stop();
     if (m_impl->io_thread.joinable()) m_impl->io_thread.join();
     BOOST_LOG_TRIVIAL(info) << "virtual-ssdp: listener down";
+}
+
+uint16_t VirtualSsdpDiscovery::advertised_port(const std::string& dev_id) {
+    std::lock_guard<std::mutex> lk(port_cache_mu());
+    auto it = port_cache().find(dev_id);
+    return it == port_cache().end() ? 0 : it->second;
+}
+
+uint16_t VirtualSsdpDiscovery::probe_port(const std::string& bridge_ip,
+                                          const std::string& dev_id,
+                                          int timeout_ms) {
+    if (bridge_ip.empty() || dev_id.empty()) return 0;
+    // Already learned it (live listener or a prior probe)? Skip the network.
+    if (uint16_t cached = advertised_port(dev_id)) return cached;
+
+    uint16_t found = 0;
+    try {
+        boost::system::error_code ec;
+        const auto addr = asio::ip::make_address(bridge_ip, ec);
+        if (ec) return 0;
+
+        asio::io_context io;
+        udp::socket sock(io, udp::endpoint(udp::v4(), 0));
+        const std::string body =
+            "M-SEARCH * HTTP/1.1\r\n"
+            "HOST: " + bridge_ip + ":" + std::to_string(kSsdpPort) + "\r\n"
+            "MAN: \"ssdp:discover\"\r\n"
+            "MX: 1\r\n"
+            "ST: " + std::string(kBambuST) + "\r\n\r\n";
+        sock.send_to(asio::buffer(body), udp::endpoint(addr, kSsdpPort), 0, ec);
+        if (ec) return 0;
+
+        // Read replies until we find dev_id or the timeout elapses, caching
+        // every advertised port we see along the way (one probe warms the
+        // cache for all of the bridge's printers).
+        std::array<char, 8192> rbuf{};
+        udp::endpoint          from;
+        std::function<void()>  do_recv;
+        do_recv = [&]() {
+            sock.async_receive_from(
+                asio::buffer(rbuf), from,
+                [&](const boost::system::error_code& rec_ec, std::size_t n) {
+                    if (rec_ec || n == 0) return;        // stop: no more work
+                    std::string pkt(rbuf.data(), rbuf.data() + n);
+                    auto h = parse_headers(pkt);
+                    const std::string u = h["usn"];
+                    if (usn_is_virtual(u)) {
+                        const uint16_t p = mqtt_port_from_headers(h);
+                        cache_port(u, p);
+                        if (p && u == dev_id) { found = p; return; }  // done
+                    }
+                    do_recv();                            // keep listening
+                });
+        };
+        do_recv();
+        io.run_for(std::chrono::milliseconds(timeout_ms));
+    } catch (...) { /* best-effort: fall through to whatever we cached */ }
+
+    return found ? found : advertised_port(dev_id);
 }
 
 } // namespace Slic3r

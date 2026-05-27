@@ -27,7 +27,9 @@
 #ifndef SLIC3R_VIRTUAL_SSDP_DISCOVERY_HPP
 #define SLIC3R_VIRTUAL_SSDP_DISCOVERY_HPP
 
+#include <cstdint>
 #include <memory>
+#include <string>
 
 namespace Slic3r {
 
@@ -46,6 +48,27 @@ public:
     // Tear the listener down. Stops the I/O thread, closes the socket.
     // Safe to call when never started or after a previous stop.
     void stop();
+
+    // --- Per-printer MQTT port resolution (no manual config required) ---
+    //
+    // The bridge advertises one MQTT port per virtual printer via the
+    // `Bambu-Mqtt-Port` SSDP header. These statics let the VirtualMqttClient
+    // port resolver obtain that port automatically instead of falling back
+    // to the 8883 default (which is only correct for one printer):
+    //
+    //   advertised_port() returns the latest port the running listener has
+    //   recorded for `dev_id` from any NOTIFY / M-SEARCH reply (0 if none
+    //   seen yet — process-wide, thread-safe cache).
+    //
+    //   probe_port() is the cold-cache fallback: it sends a synchronous
+    //   UNICAST M-SEARCH straight to the known bridge IP (reliable on
+    //   networks that drop multicast / behind a host firewall) and caches
+    //   every port in the reply, returning the one for `dev_id` (0 on
+    //   timeout). Safe to call with no listener running.
+    static uint16_t advertised_port(const std::string& dev_id);
+    static uint16_t probe_port(const std::string& bridge_ip,
+                               const std::string& dev_id,
+                               int timeout_ms = 800);
 
 private:
     struct Impl;
