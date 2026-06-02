@@ -2,6 +2,7 @@
 
 #include "VirtualSsdpDiscovery.hpp"
 
+#include "StructuredLog.hpp"          // BBL_LOG — env-gated JSONL diagnostics
 #include "VirtualLanPrinterStore.hpp"
 #include "VirtualSsdpAliveJson.hpp"  // pure JSON builder (standalone-testable)
 // Resolved from the consuming slicer's src/slic3r/ include path,
@@ -477,22 +478,39 @@ uint16_t VirtualSsdpDiscovery::probe_port(const std::string& bridge_ip,
 uint16_t VirtualSsdpDiscovery::resolve_mqtt_port(const std::string& dev_id,
                                                  const std::string& bridge_ip_hint) {
     // 1. live SSDP cache (freshest — set by the running listener)
-    if (uint16_t p = advertised_port(dev_id)) return p;
+    if (uint16_t p = advertised_port(dev_id)) {
+        BBL_LOG("virtual-ssdp", "port_resolved")
+            .str("dev_id", dev_id).num("port", p).str("source", "ssdp_cache");
+        return p;
+    }
     // 2. persisted store; capture lan_ip for the probe fallback
     std::string ip = bridge_ip_hint;
     {
         VirtualLanPrinterStore store;
         for (const auto& e : store.load()) {
             if (e.dev_id == dev_id) {
-                if (e.mqtt_port) return e.mqtt_port;
+                if (e.mqtt_port) {
+                    BBL_LOG("virtual-ssdp", "port_resolved")
+                        .str("dev_id", dev_id).num("port", e.mqtt_port)
+                        .str("source", "persisted_store");
+                    return e.mqtt_port;
+                }
                 if (ip.empty()) ip = e.lan_ip;
                 break;
             }
         }
     }
     // 3. unicast probe of the bridge host (reliable where multicast is dropped)
-    if (!ip.empty())
-        if (uint16_t p = probe_port(ip, dev_id)) return p;
+    if (!ip.empty()) {
+        if (uint16_t p = probe_port(ip, dev_id)) {
+            BBL_LOG("virtual-ssdp", "port_resolved")
+                .str("dev_id", dev_id).num("port", p).str("source", "unicast_probe");
+            return p;
+        }
+    }
+    BBL_LOG("virtual-ssdp", "port_resolved")
+        .str("dev_id", dev_id).num("port", 0)
+        .str("source", "none").str("err", "not_found");
     return 0;
 }
 
@@ -502,7 +520,14 @@ uint16_t VirtualSsdpDiscovery::port_for(const std::string& dev_id,
     constexpr uint16_t kMqttBase = 8883;
     uint16_t mp = resolve_mqtt_port(dev_id, bridge_ip_hint);
     if (mp == 0) mp = kMqttBase;   // unknown dev -> index 0 (base port)
-    return static_cast<uint16_t>(int(port_base) + (int(mp) - int(kMqttBase)));
+    const uint16_t resolved =
+        static_cast<uint16_t>(int(port_base) + (int(mp) - int(kMqttBase)));
+    BBL_LOG("virtual-ssdp", "port_for")
+        .str("dev_id",      dev_id)
+        .num("port_base",   port_base)
+        .num("mqtt_port",   mp)
+        .num("resolved",    resolved);
+    return resolved;
 }
 
 } // namespace Slic3r

@@ -10,6 +10,8 @@
 
 #include "VirtualFtpsClient.hpp"
 
+#include "StructuredLog.hpp"          // BBL_LOG — env-gated JSONL diagnostics
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -242,69 +244,91 @@ bool parse_pasv(const std::string& r, std::string& ip, uint16_t& port) {
 int upload(const UploadParams& p,
            ProgressFn          progress,
            CancelledFn         cancelled) {
+    BBL_LOG("ftps-client", "upload_begin")
+        .str("host",         p.host)
+        .num("port",         p.port)
+        .str("user",         p.user)
+        .num("pass_len",     p.pass.size())
+        .str("remote_name",  p.remote_name)
+        .str("local_path",   p.local_path);
     auto notify = [&](int pct, const std::string& s) {
         if (progress) progress(pct, s);
     };
     auto stop_requested = [&]() {
         return cancelled && cancelled();
     };
+    // Tiny helper so every `return -N` carries an explicit "upload_end"
+    // record with the same diagnostic shape — makes timeline reassembly
+    // trivial in jq.
+    auto emit_end = [&](int rc, const char* phase, const char* reply = nullptr) {
+        BBL_LOG("ftps-client", "upload_end")
+            .str("phase", phase)
+            .num("rc",    rc)
+            .str("last_reply", reply ? std::string_view{reply} : std::string_view{});
+    };
 
     // --- 1. Control channel ----------------------------------------------
     TlsConn ctl;
     notify(1, "Connecting to FTPS");
-    if (!ctl.connect(p.host, p.port)) return -1;
+    if (!ctl.connect(p.host, p.port)) { emit_end(-1, "ctl_connect"); return -1; }
 
     std::string r = ctl.read_reply();
+    BBL_LOG("ftps-client", "welcome").num("code", reply_code(r)).str("reply", r);
     if (reply_code(r) != 220) {
         std::fprintf(stderr,
             "[virtual-ftps] unexpected welcome: %s\n", r.c_str());
-        return -2;
+        emit_end(-2, "welcome", r.c_str()); return -2;
     }
 
     // USER / PASS
     notify(5, "Authenticating");
-    if (!ctl.write_line("USER " + p.user)) return -3;
+    if (!ctl.write_line("USER " + p.user)) { emit_end(-3, "USER_write"); return -3; }
     r = ctl.read_reply();
     const int c1 = reply_code(r);
+    BBL_LOG("ftps-client", "user_reply").num("code", c1).str("reply", r);
     if (c1 == 230) {
         // logged in without password — unusual, accept
     } else if (c1 == 331) {
-        if (!ctl.write_line("PASS " + p.pass)) return -3;
+        if (!ctl.write_line("PASS " + p.pass)) { emit_end(-3, "PASS_write"); return -3; }
         r = ctl.read_reply();
-        if (reply_code(r) != 230) {
+        const int c_pass = reply_code(r);
+        BBL_LOG("ftps-client", "pass_reply").num("code", c_pass).str("reply", r);
+        if (c_pass != 230) {
             std::fprintf(stderr,
                 "[virtual-ftps] PASS rejected: %s\n", r.c_str());
-            return -4;
+            emit_end(-4, "PASS_rejected", r.c_str()); return -4;
         }
     } else {
         std::fprintf(stderr,
             "[virtual-ftps] USER unexpected: %s\n", r.c_str());
-        return -4;
+        emit_end(-4, "USER_unexpected", r.c_str()); return -4;
     }
 
     // Binary mode
-    if (!ctl.write_line("TYPE I")) return -3;
+    if (!ctl.write_line("TYPE I")) { emit_end(-3, "TYPE_write"); return -3; }
     r = ctl.read_reply();
+    BBL_LOG("ftps-client", "type_reply").num("code", reply_code(r)).str("reply", r);
     if (reply_code(r) != 200) {
         std::fprintf(stderr,
             "[virtual-ftps] TYPE I rejected: %s\n", r.c_str());
-        return -5;
+        emit_end(-5, "TYPE_rejected", r.c_str()); return -5;
     }
 
     // PASV
-    if (!ctl.write_line("PASV")) return -3;
+    if (!ctl.write_line("PASV")) { emit_end(-3, "PASV_write"); return -3; }
     r = ctl.read_reply();
+    BBL_LOG("ftps-client", "pasv_reply").num("code", reply_code(r)).str("reply", r);
     if (reply_code(r) != 227) {
         std::fprintf(stderr,
             "[virtual-ftps] PASV rejected: %s\n", r.c_str());
-        return -6;
+        emit_end(-6, "PASV_rejected", r.c_str()); return -6;
     }
     std::string  data_ip;
     uint16_t     data_port = 0;
     if (!parse_pasv(r, data_ip, data_port)) {
         std::fprintf(stderr,
             "[virtual-ftps] PASV parse failed: %s\n", r.c_str());
-        return -7;
+        emit_end(-7, "PASV_parse", r.c_str()); return -7;
     }
     // Many servers return a useless private IP — fall back to the
     // control channel's IP, which is the one the slicer actually
@@ -314,17 +338,21 @@ int upload(const UploadParams& p,
     // --- 2. Data channel -------------------------------------------------
     notify(10, "Opening data channel");
     TlsConn data;
-    if (!data.connect(data_ip, data_port)) return -8;
+    BBL_LOG("ftps-client", "data_connect_begin").str("ip", data_ip).num("port", data_port);
+    if (!data.connect(data_ip, data_port)) { emit_end(-8, "data_connect"); return -8; }
+    BBL_LOG("ftps-client", "data_connect_ok").str("ip", data_ip).num("port", data_port);
 
     // --- 3. STOR ---------------------------------------------------------
-    if (stop_requested()) return -9;
-    if (!ctl.write_line("STOR " + p.remote_name)) return -3;
+    if (stop_requested()) { emit_end(-9, "stor_cancelled"); return -9; }
+    BBL_LOG("ftps-client", "stor_send").str("remote", p.remote_name);
+    if (!ctl.write_line("STOR " + p.remote_name)) { emit_end(-3, "STOR_write"); return -3; }
     r = ctl.read_reply();
     int c = reply_code(r);
+    BBL_LOG("ftps-client", "stor_initial_reply").num("code", c).str("reply", r);
     if (c != 150 && c != 125) {
         std::fprintf(stderr,
             "[virtual-ftps] STOR rejected: %s\n", r.c_str());
-        return -10;
+        emit_end(-10, "STOR_initial_rejected", r.c_str()); return -10;
     }
 
     // --- 4. Stream the file ---------------------------------------------
@@ -374,16 +402,22 @@ int upload(const UploadParams& p,
     // Final reply: 226 Transfer complete (or 250).
     r = ctl.read_reply();
     c = reply_code(r);
+    BBL_LOG("ftps-client", "stor_final_reply")
+        .num("code", c)
+        .str("reply", r)
+        .num("bytes_sent", sent)
+        .num("bytes_total", total);
     if (c != 226 && c != 250) {
         std::fprintf(stderr,
             "[virtual-ftps] STOR final reply unexpected: %s\n",
             r.c_str());
-        return -13;
+        emit_end(-13, "STOR_final_rejected", r.c_str()); return -13;
     }
 
     ctl.write_line("QUIT");
     ctl.read_reply();
     notify(100, "Upload complete");
+    emit_end(0, "ok");
     return 0;
 }
 

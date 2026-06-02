@@ -73,6 +73,8 @@ endif()
 set(_bvc_sources_core
     MqttFraming.cpp
     MqttFraming.hpp
+    StructuredLog.cpp
+    StructuredLog.hpp
     VirtualMqttClient.cpp
     VirtualMqttClient.hpp
     VirtualFtpsClient.cpp

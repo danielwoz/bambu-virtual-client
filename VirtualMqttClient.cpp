@@ -10,6 +10,7 @@
 #include "VirtualMqttClient.hpp"
 
 #include "MqttFraming.hpp"
+#include "StructuredLog.hpp"           // BBL_LOG — env-gated JSONL diagnostics
 #include "VirtualSsdpDiscovery.hpp"   // unicast port probe for cold-cache connects
 
 #include <array>
@@ -335,6 +336,10 @@ int VirtualMqttClient::connect_printer(std::string dev_id,
         "[virtual-mqtt] connect dev=%s host=%s -> port=%u\n",
         dev_id.c_str(), host.c_str(), static_cast<unsigned>(port));
     std::fflush(stderr);
+    BBL_LOG("virtual-mqtt", "connect_begin")
+        .str("dev_id", dev_id)
+        .str("host",   host)
+        .num("port",   port);
 
     // Try the initial TCP+TLS handshake. If it fails because the bridge
     // isn't listening yet (the common case during slicer startup before
@@ -379,6 +384,12 @@ int VirtualMqttClient::connect_printer(std::string dev_id,
         m_sessions[dev_id] = std::move(sess);
     }
     raw->io_thread = std::thread(session_loop, this, raw);
+    BBL_LOG("virtual-mqtt", "connect_result")
+        .str("dev_id",  raw->dev_id)
+        .num("port",    raw->port)
+        .boolean("tcp_ok", raw->fd  >= 0)
+        .boolean("tls_ok", raw->ssl != nullptr)
+        .num("rc",      0);
     return 0;
 }
 
@@ -430,6 +441,12 @@ int VirtualMqttClient::send_message(std::string dev_id,
         std::lock_guard<std::mutex> lk(m_mu);
         auto it = m_sessions.find(dev_id);
         if (it == m_sessions.end()) {
+            BBL_LOG("virtual-mqtt", "publish_send")
+                .str("dev_id", dev_id)
+                .num("qos",    qos)
+                .num("bytes",  json.size())
+                .str("err",    "no_session")
+                .num("rc",     -1);
             return -1;
         }
         sess = it->second.get();
@@ -450,10 +467,28 @@ int VirtualMqttClient::send_message(std::string dev_id,
         // momentarily null. Drop the message rather than crashing. The
         // slicer's state machine retries push_status frequently — the
         // next attempt after CONNACK will go through.
+        BBL_LOG("virtual-mqtt", "publish_send")
+            .str("dev_id", dev_id)
+            .str("topic",  topic)
+            .num("qos",    qos)
+            .num("bytes",  json.size())
+            .str("err",    "ssl_null_reconnect_window")
+            .num("rc",     -1);
         return -1;
     }
     int n = SSL_write(sess->ssl, pkt.data(), static_cast<int>(pkt.size()));
-    if (n != static_cast<int>(pkt.size())) {
+    const bool wrote_all = (n == static_cast<int>(pkt.size()));
+    BBL_LOG("virtual-mqtt", "publish_send")
+        .str("dev_id", dev_id)
+        .str("topic",  topic)
+        .num("qos",    qos)
+        .num("bytes",  json.size())
+        // First 16 bytes of the JSON payload, hex — handy for cross-correlating
+        // against the bridge log without leaking sensitive content.
+        .bytes_prefix_hex("payload_hex", json.data(), json.size(), 16)
+        .num("ssl_write_n", n)
+        .num("rc", wrote_all ? 0 : -1);
+    if (!wrote_all) {
         return -1;
     }
     return 0;
@@ -485,6 +520,13 @@ void VirtualMqttClient::session_loop(VirtualMqttClient* self,
             std::lock_guard<std::mutex> lk(self->m_mu);
             cb = self->m_on_message;
         }
+        BBL_LOG("virtual-mqtt", "publish_recv")
+            .str("dev_id", sess->dev_id)
+            .str("topic",  topic_unused)
+            .num("bytes",  payload.size())
+            .bytes_prefix_hex("payload_hex",
+                              payload.data(), payload.size(), 16)
+            .boolean("delivered_to_cb", cb != nullptr);
         if (cb) {
             std::string msg(payload.begin(), payload.end());
             cb(sess->dev_id, msg);
