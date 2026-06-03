@@ -477,30 +477,44 @@ uint16_t VirtualSsdpDiscovery::probe_port(const std::string& bridge_ip,
 
 uint16_t VirtualSsdpDiscovery::resolve_mqtt_port(const std::string& dev_id,
                                                  const std::string& bridge_ip_hint) {
-    // 1. live SSDP cache (freshest — set by the running listener)
+    // Resolution order:
+    //   1. live SSDP cache       (freshest — set by the running listener)
+    //   2. unicast SSDP probe    (preferred over the persisted store: the
+    //                             bridge's port assignment can change between
+    //                             sessions — printer reordering, port-offset
+    //                             rotation, Windows host with multicast
+    //                             filtered out — and the persisted port goes
+    //                             stale silently. A unicast M-SEARCH costs
+    //                             ~800ms worst-case but only fires when the
+    //                             live cache is cold, and warms the cache
+    //                             for every printer on the bridge from one
+    //                             round-trip.)
+    //   3. persisted store port  (last resort: the probe failed/timed out;
+    //                             stale port beats giving up entirely, and
+    //                             the connect failure that follows will be
+    //                             handled by VirtualMqttClient's retry path.)
     if (uint16_t p = advertised_port(dev_id)) {
         BBL_LOG("virtual-ssdp", "port_resolved")
             .str("dev_id", dev_id).num("port", p).str("source", "ssdp_cache");
         return p;
     }
-    // 2. persisted store; capture lan_ip for the probe fallback
+
+    // Find the bridge IP to probe — from the caller's hint or the store.
     std::string ip = bridge_ip_hint;
+    uint16_t    persisted_port = 0;
     {
         VirtualLanPrinterStore store;
         for (const auto& e : store.load()) {
             if (e.dev_id == dev_id) {
-                if (e.mqtt_port) {
-                    BBL_LOG("virtual-ssdp", "port_resolved")
-                        .str("dev_id", dev_id).num("port", e.mqtt_port)
-                        .str("source", "persisted_store");
-                    return e.mqtt_port;
-                }
+                persisted_port = e.mqtt_port;
                 if (ip.empty()) ip = e.lan_ip;
                 break;
             }
         }
     }
-    // 3. unicast probe of the bridge host (reliable where multicast is dropped)
+
+    // Unicast probe of the bridge host — reliable where multicast is dropped
+    // (Windows Firewall, segmented networks, hyper-V/WSL bridges).
     if (!ip.empty()) {
         if (uint16_t p = probe_port(ip, dev_id)) {
             BBL_LOG("virtual-ssdp", "port_resolved")
@@ -508,6 +522,16 @@ uint16_t VirtualSsdpDiscovery::resolve_mqtt_port(const std::string& dev_id,
             return p;
         }
     }
+
+    // Last resort — persisted port. May be stale; the connect path's failure
+    // handling is the user's signal to re-probe / re-pair.
+    if (persisted_port) {
+        BBL_LOG("virtual-ssdp", "port_resolved")
+            .str("dev_id", dev_id).num("port", persisted_port)
+            .str("source", "persisted_store").str("note", "probe_failed_or_no_ip");
+        return persisted_port;
+    }
+
     BBL_LOG("virtual-ssdp", "port_resolved")
         .str("dev_id", dev_id).num("port", 0)
         .str("source", "none").str("err", "not_found");
