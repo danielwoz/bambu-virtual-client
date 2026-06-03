@@ -131,15 +131,46 @@ bool is_notify(const std::string& payload) {
 // Process-wide dev_id -> advertised MQTT port cache, shared by the
 // multicast listener and the unicast probe. Feeds the VirtualMqttClient
 // port resolver so per-printer ports resolve with zero manual config.
+// Per-entry timestamp lets us age stale ports out of the cache. The
+// bridge re-NOTIFYs every 30 s, so 90 s (3 missed NOTIFYs) is the
+// soft "trust horizon": after that the cache returns a miss and the
+// resolver falls through to a fresh unicast probe. On Windows hosts
+// where multicast NOTIFY never arrives, this means probed values
+// also age out and re-probe on their own, surfacing port rotations
+// without a slicer restart.
+struct PortCacheEntry {
+    uint16_t                                  port;
+    std::chrono::steady_clock::time_point     when;
+};
+constexpr std::chrono::seconds kPortCacheTtl{90};
+
 std::mutex& port_cache_mu() { static std::mutex m; return m; }
-std::map<std::string, uint16_t>& port_cache() {
-    static std::map<std::string, uint16_t> m;
+std::map<std::string, PortCacheEntry>& port_cache() {
+    static std::map<std::string, PortCacheEntry> m;
     return m;
 }
 void cache_port(const std::string& dev_id, uint16_t port) {
     if (dev_id.empty() || port == 0) return;
     std::lock_guard<std::mutex> lk(port_cache_mu());
-    port_cache()[dev_id] = port;
+    port_cache()[dev_id] = { port, std::chrono::steady_clock::now() };
+}
+
+// Parallel IP cache. Reuses the same TTL as the port cache because the
+// bridge stamps both in the same SSDP packet — if one is stale the
+// other is too. The listener and probe_port populate this on every
+// reply they parse.
+struct IpCacheEntry {
+    std::string                               ip;
+    std::chrono::steady_clock::time_point     when;
+};
+std::map<std::string, IpCacheEntry>& ip_cache() {
+    static std::map<std::string, IpCacheEntry> m;
+    return m;
+}
+void cache_ip(const std::string& dev_id, const std::string& ip) {
+    if (dev_id.empty() || ip.empty()) return;
+    std::lock_guard<std::mutex> lk(port_cache_mu());
+    ip_cache()[dev_id] = { ip, std::chrono::steady_clock::now() };
 }
 
 // Extract the advertised MQTT port from a parsed SSDP header map: the
@@ -237,6 +268,7 @@ struct VirtualSsdpDiscovery::Impl {
         // advertised MQTT port for this dev_id.
         const uint16_t adv_port = mqtt_port_from_headers(headers);
         cache_port(usn, adv_port);
+        cache_ip(usn, bridge_ip);   // freshen IP cache on every advertisement
 
         // Build the alive JSON for DeviceManager.
         const std::string alive_json =
@@ -419,7 +451,102 @@ void VirtualSsdpDiscovery::stop() {
 uint16_t VirtualSsdpDiscovery::advertised_port(const std::string& dev_id) {
     std::lock_guard<std::mutex> lk(port_cache_mu());
     auto it = port_cache().find(dev_id);
-    return it == port_cache().end() ? 0 : it->second;
+    if (it == port_cache().end()) return 0;
+    // Soft TTL: a port we last saw > kPortCacheTtl ago counts as unknown
+    // so the resolver re-probes. The entry stays in the map (we don't
+    // erase here under the read lock); the next cache_port write or
+    // invalidate_port call replaces it.
+    if (std::chrono::steady_clock::now() - it->second.when > kPortCacheTtl)
+        return 0;
+    return it->second.port;
+}
+
+void VirtualSsdpDiscovery::invalidate_port(const std::string& dev_id) {
+    if (dev_id.empty()) return;
+    std::lock_guard<std::mutex> lk(port_cache_mu());
+    port_cache().erase(dev_id);
+}
+
+std::string VirtualSsdpDiscovery::advertised_ip(const std::string& dev_id) {
+    std::lock_guard<std::mutex> lk(port_cache_mu());
+    auto it = ip_cache().find(dev_id);
+    if (it == ip_cache().end()) return {};
+    if (std::chrono::steady_clock::now() - it->second.when > kPortCacheTtl)
+        return {};
+    return it->second.ip;
+}
+
+void VirtualSsdpDiscovery::invalidate_ip(const std::string& dev_id) {
+    if (dev_id.empty()) return;
+    std::lock_guard<std::mutex> lk(port_cache_mu());
+    ip_cache().erase(dev_id);
+}
+
+VirtualSsdpDiscovery::BridgeEndpoint
+VirtualSsdpDiscovery::rediscover_bridge(const std::string& dev_id, int timeout_ms) {
+    // Multicast M-SEARCH twin of probe_port: where probe_port dials a known
+    // bridge IP, this fans the query out across the LAN so we recover a
+    // bridge that has moved hosts (e.g. Linux→Windows, DHCP rotated, user
+    // ran the bridge on a different machine). Replies come back as unicast
+    // UDP to our ephemeral source port — that's permitted inbound on
+    // Windows even when the bridge's spontaneous NOTIFY multicast is not,
+    // so this path is the one that actually closes the loop for hosts
+    // running behind a default Windows firewall.
+    BridgeEndpoint result{};
+    if (dev_id.empty()) return result;
+
+    try {
+        asio::io_context io;
+        udp::socket sock(io, udp::endpoint(udp::v4(), 0));
+        boost::system::error_code ec;
+        // Allow outbound multicast and set TTL low — these are LAN packets.
+        sock.set_option(asio::ip::multicast::hops(2), ec);
+
+        const auto mcast = asio::ip::make_address("239.255.255.250");
+        const std::string body =
+            "M-SEARCH * HTTP/1.1\r\n"
+            "HOST: 239.255.255.250:" + std::to_string(kSsdpPort) + "\r\n"
+            "MAN: \"ssdp:discover\"\r\n"
+            "MX: 1\r\n"
+            "ST: " + std::string(kBambuST) + "\r\n\r\n";
+        sock.send_to(asio::buffer(body), udp::endpoint(mcast, kSsdpPort), 0, ec);
+        if (ec) return result;
+
+        std::array<char, 8192> rbuf{};
+        udp::endpoint          from;
+        std::function<void()>  do_recv;
+        do_recv = [&]() {
+            sock.async_receive_from(
+                asio::buffer(rbuf), from,
+                [&](const boost::system::error_code& rec_ec, std::size_t n) {
+                    if (rec_ec || n == 0) return;
+                    std::string pkt(rbuf.data(), rbuf.data() + n);
+                    auto h = parse_headers(pkt);
+                    const std::string u = h["usn"];
+                    if (usn_is_virtual(u)) {
+                        const uint16_t    p  = mqtt_port_from_headers(h);
+                        const std::string ip = from.address().to_string();
+                        cache_port(u, p);
+                        cache_ip(u, ip);
+                        if (u == dev_id) {
+                            // Keep going to allow late replies, but
+                            // remember the freshest answer.
+                            result.ip   = ip;
+                            result.port = p;
+                        }
+                    }
+                    do_recv();
+                });
+        };
+        do_recv();
+        io.run_for(std::chrono::milliseconds(timeout_ms));
+    } catch (...) { /* fall through to whatever we cached */ }
+
+    // If we missed the targeted reply, fall back to whatever the cache now
+    // holds — probably an entry the loop just cached but didn't return.
+    if (result.ip.empty())   result.ip   = advertised_ip(dev_id);
+    if (result.port == 0)    result.port = advertised_port(dev_id);
+    return result;
 }
 
 uint16_t VirtualSsdpDiscovery::probe_port(const std::string& bridge_ip,
@@ -463,6 +590,7 @@ uint16_t VirtualSsdpDiscovery::probe_port(const std::string& bridge_ip,
                     if (usn_is_virtual(u)) {
                         const uint16_t p = mqtt_port_from_headers(h);
                         cache_port(u, p);
+                        cache_ip(u, from.address().to_string());
                         if (p && u == dev_id) { found = p; return; }  // done
                     }
                     do_recv();                            // keep listening
