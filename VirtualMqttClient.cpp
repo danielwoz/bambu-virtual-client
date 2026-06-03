@@ -539,7 +539,51 @@ void VirtualMqttClient::session_loop(VirtualMqttClient* self,
     // send_message can't race against the swap.
     auto reopen_tls = [&]() -> bool {
         int new_fd = tcp_connect(sess->host, sess->port);
-        if (new_fd < 0) return false;
+        if (new_fd < 0) {
+            // tcp_connect to the cached endpoint failed. Two reasons the
+            // bridge can become unreachable mid-session:
+            //   (a) it rotated its mqtt port (printer reordering, the
+            //       bridge supervisor respawned a child on a new offset)
+            //   (b) it moved hosts entirely (Linux→Windows, DHCP rotated,
+            //       user ran the bridge on a different machine)
+            // Recovery is layered: first invalidate + unicast-probe at
+            // the cached IP (cheap, handles case (a) directly). If the
+            // probe also times out we have to assume (b) and fan out a
+            // multicast M-SEARCH to find the bridge wherever it is now;
+            // its unicast reply lands on our ephemeral source port even
+            // when its spontaneous NOTIFY multicast wouldn't (Windows
+            // host firewall). Each path is bounded — ~800ms + ~1500ms
+            // worst case once per host-change event; the outer
+            // backoff loop absorbs the time.
+            VirtualSsdpDiscovery::invalidate_port(sess->dev_id);
+            if (uint16_t fresh = VirtualSsdpDiscovery::probe_port(sess->host, sess->dev_id)) {
+                if (fresh != sess->port) {
+                    BBL_LOG("virtual-mqtt", "port_rotated")
+                        .str("dev_id", sess->dev_id)
+                        .num("old",    sess->port)
+                        .num("new",    fresh);
+                    std::lock_guard<std::mutex> wlk(sess->write_mu);
+                    sess->port = fresh;
+                }
+            } else {
+                // Cached IP is suspect — drop it and ask the LAN.
+                VirtualSsdpDiscovery::invalidate_ip(sess->dev_id);
+                auto found = VirtualSsdpDiscovery::rediscover_bridge(sess->dev_id);
+                if (!found.ip.empty() &&
+                    (found.ip != sess->host || (found.port && found.port != sess->port))) {
+                    BBL_LOG("virtual-mqtt", "bridge_relocated")
+                        .str("dev_id",   sess->dev_id)
+                        .str("old_host", sess->host)
+                        .str("new_host", found.ip)
+                        .num("old_port", sess->port)
+                        .num("new_port", found.port ? found.port : sess->port);
+                    std::lock_guard<std::mutex> wlk(sess->write_mu);
+                    sess->host = found.ip;
+                    if (found.port) sess->port = found.port;
+                }
+            }
+            return false;
+        }
         SSL* new_ssl = SSL_new(static_cast<SSL_CTX*>(self->m_ssl_ctx));
         if (!new_ssl) { close_fd(new_fd); return false; }
         SSL_set_fd(new_ssl, new_fd);

@@ -70,6 +70,29 @@ public:
                                const std::string& dev_id,
                                int timeout_ms = 800);
 
+    // Drop the in-memory port-cache entry for `dev_id`. The next
+    // `advertised_port` / `probe_port` call will fetch fresh data instead
+    // of returning a stale cached value. Called by VirtualMqttClient
+    // when a TCP reconnect to the cached port fails — the bridge may
+    // have rotated ports mid-session, and a fresh probe recovers
+    // without forcing the user to restart the slicer.
+    static void invalidate_port(const std::string& dev_id);
+
+    // Latest bridge IP observed for `dev_id`, with the same TTL semantics
+    // as `advertised_port`. Empty string means "unknown / aged out".
+    static std::string advertised_ip(const std::string& dev_id);
+    static void        invalidate_ip(const std::string& dev_id);
+
+    // Fire a multicast M-SEARCH and wait up to `timeout_ms` for replies,
+    // returning the freshest {ip, port} pair for `dev_id`. Use when both
+    // the cached IP and port are suspected stale (e.g. bridge moved
+    // hosts or rotated ports while the slicer wasn't listening). Returns
+    // {"", 0} if no reply mentioning `dev_id` arrived in time. Safe to
+    // call with no listener running — falls back to a transient socket.
+    struct BridgeEndpoint { std::string ip; uint16_t port; };
+    static BridgeEndpoint rediscover_bridge(const std::string& dev_id,
+                                            int timeout_ms = 1500);
+
     // One-stop per-printer MQTT-port resolution — the single source of truth
     // for EVERY virtual-client port derivation (MQTT 8883+i, FTPS 39990+i,
     // RTSP 38322+i, vtun 39998+i; the bridge assigns the same index `i` to
