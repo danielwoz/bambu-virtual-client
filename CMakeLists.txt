@@ -139,6 +139,11 @@ if(BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR)
         ${BAMBU_VIRTUAL_CLIENT_JSON_INCLUDE_DIR})
 endif()
 
+if(BAMBU_VIRTUAL_CLIENT_EIGEN_INCLUDE_DIR)
+    target_include_directories(bambu_virtual_client SYSTEM PUBLIC
+        ${BAMBU_VIRTUAL_CLIENT_EIGEN_INCLUDE_DIR})
+endif()
+
 if(_bvc_have_slicer)
     # PUBLIC: the lib's headers transitively #include "BambuTunnel.h" and
     # rely on the slicer's bambu_networking.hpp / GUI_App.hpp on the include

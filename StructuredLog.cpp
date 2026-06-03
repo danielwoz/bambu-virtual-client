@@ -11,7 +11,12 @@
 #include <ctime>
 #include <thread>
 
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 namespace Slic3r { namespace bridge { namespace structlog {
 
@@ -27,7 +32,11 @@ void format_iso8601_now(char out[28]) {
                             now - secs).count();
     const std::time_t t = clock::to_time_t(secs);
     std::tm tm{};
+#ifdef _WIN32
+    ::gmtime_s(&tm, &t);
+#else
     ::gmtime_r(&t, &tm);
+#endif
     std::snprintf(out, 28,
                   "%04d-%02d-%02dT%02d:%02d:%02d.%06ldZ",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
