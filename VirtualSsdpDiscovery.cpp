@@ -397,6 +397,64 @@ struct VirtualSsdpDiscovery::Impl {
             << "virtual-ssdp: hydrated " << rows.size()
             << " entries from persistent store";
     }
+
+    // Background sweep right after startup: the rows we just handed to
+    // DeviceManager carry whatever lan_ip the store had at last shutdown,
+    // which goes stale when the bridge host's IP changes (DHCP rotation,
+    // user moved the bridge to a different machine). The listener's
+    // periodic M-SEARCH (every 60s, from the port-1900 socket) is the
+    // long-term refresh — but it doesn't fire for 60s and its replies
+    // come back to UDP 1900 which Windows Firewall drops by default.
+    // So fire one ephemeral-socket multicast burst NOW, on a detached
+    // thread, and redeliver any entry whose IP changed. The burst warms
+    // the cache for every bridge that replies (one round-trip covers
+    // every printer on every bridge on the LAN). Bounded to ~1.5s
+    // worst case; on a typical home LAN replies come back in <100ms.
+    void rediscover_after_hydrate_async() {
+        std::thread([this]() {
+            auto rows = store.load();
+            if (rows.empty()) return;
+            // One M-SEARCH burst — rediscover_bridge() caches every
+            // dev_id from every reply it parses, so picking any dev_id
+            // here is fine; the return value is discarded.
+            VirtualSsdpDiscovery::rediscover_bridge(rows.front().dev_id, 1500);
+
+            for (const auto& prev : rows) {
+                const std::string fresh_ip   = VirtualSsdpDiscovery::advertised_ip(prev.dev_id);
+                const uint16_t    fresh_port = VirtualSsdpDiscovery::advertised_port(prev.dev_id);
+                if (fresh_ip.empty()) continue;            // no reply for this dev_id
+                if (fresh_ip == prev.lan_ip) continue;     // already correct
+
+                // Persist the corrected entry so the next launch hydrates
+                // with the right IP even before this sweep runs again.
+                VirtualLanPrinterStore::Entry updated = prev;
+                updated.lan_ip = fresh_ip;
+                if (fresh_port) updated.mqtt_port = fresh_port;
+                store.upsert(updated);
+
+                AliveInfo info;
+                info.dev_name = prev.dev_name;
+                info.dev_id   = prev.dev_id;
+                info.dev_ip   = fresh_ip;
+                info.dev_type = prev.printer_type;
+                const std::string alive_json = build_alive_json(info);
+                try {
+                    auto& app = GUI::wxGetApp();
+                    app.CallAfter([alive_json]() {
+                        auto& app2 = GUI::wxGetApp();
+                        if (app2.is_closing()) return;
+                        if (auto* dm = app2.getDeviceManager()) {
+                            dm->on_machine_alive(alive_json);
+                        }
+                    });
+                } catch (...) {
+                }
+                BOOST_LOG_TRIVIAL(info)
+                    << "virtual-ssdp: startup rediscovery refreshed dev_id=" << prev.dev_id
+                    << " ip " << prev.lan_ip << " -> " << fresh_ip;
+            }
+        }).detach();
+    }
 };
 
 VirtualSsdpDiscovery::VirtualSsdpDiscovery() : m_impl(std::make_unique<Impl>()) {}
@@ -410,6 +468,12 @@ void VirtualSsdpDiscovery::start() {
     if (m_impl->running.exchange(true)) return;
 
     m_impl->hydrate_from_store();
+    // Hydrate handed DeviceManager whatever IP was persisted at last
+    // shutdown. Kick off a background ephemeral-socket M-SEARCH burst
+    // so any stale IP gets corrected within ~1.5s — well before the
+    // listener's port-1900 periodic probe (60s) catches up, and via a
+    // path Windows Firewall doesn't drop. Detached; never blocks start().
+    m_impl->rediscover_after_hydrate_async();
 
     if (!m_impl->open_multicast_socket()) {
         // Bind failed (port 1900 owned by another process etc.). Keep
