@@ -114,6 +114,24 @@ uint16_t parse_location_port(const std::string& location) {
     }
 }
 
+// Parse the host (IP) out of an SSDP LOCATION header — the bridge's real
+// service address. This is authoritative: on a multi-homed host the bridge's
+// multicast NOTIFY can egress from a secondary interface (e.g. a WSL/Hyper-V
+// vEthernet adapter at 172.25.x), so the UDP packet's SOURCE address is an IP
+// the slicer can't reach, while LOCATION always carries the intended LAN IP.
+std::string parse_location_host(const std::string& location) {
+    std::string s = location;
+    boost::algorithm::trim(s);
+    if (boost::algorithm::starts_with(s, "http://"))  s = s.substr(7);
+    if (boost::algorithm::starts_with(s, "https://")) s = s.substr(8);
+    auto slash = s.find('/');
+    if (slash != std::string::npos) s = s.substr(0, slash);
+    auto colon = s.find(':');
+    if (colon != std::string::npos) s = s.substr(0, colon);
+    boost::algorithm::trim(s);
+    return s;
+}
+
 bool usn_is_virtual(const std::string& usn) {
     return usn.size() >= 4 && usn.compare(0, 4, "FFFF") == 0;
 }
@@ -260,7 +278,15 @@ struct VirtualSsdpDiscovery::Impl {
         const std::string usn = headers["usn"];
         if (!usn_is_virtual(usn)) return;
 
-        const std::string bridge_ip = from.address().to_string();
+        // Prefer the IP from the LOCATION header (the bridge's real service
+        // address) over the UDP source address. On a multi-homed host the
+        // NOTIFY can arrive from a secondary interface (e.g. WSL/Hyper-V
+        // vEthernet at 172.25.x) the slicer can't reach, even though LOCATION
+        // correctly carries the LAN IP. Fall back to the source address only
+        // when LOCATION has no usable IPv4 literal.
+        std::string bridge_ip = parse_location_host(headers["location"]);
+        if (bridge_ip.find('.') == std::string::npos)
+            bridge_ip = from.address().to_string();
 
         // Always refresh the live port cache from this advertisement — even
         // when the store dedupe below decides nothing meaningful changed —
@@ -590,7 +616,13 @@ uint16_t VirtualSsdpDiscovery::probe_port(const std::string& bridge_ip,
                     if (usn_is_virtual(u)) {
                         const uint16_t p = mqtt_port_from_headers(h);
                         cache_port(u, p);
-                        cache_ip(u, from.address().to_string());
+                        // LOCATION IP is authoritative over the UDP source addr
+                        // (multi-homed host: probe reply can come from a WSL/
+                        // Hyper-V vEthernet interface the slicer can't reach).
+                        std::string pip = parse_location_host(h["location"]);
+                        if (pip.find('.') == std::string::npos)
+                            pip = from.address().to_string();
+                        cache_ip(u, pip);
                         if (p && u == dev_id) { found = p; return; }  // done
                     }
                     do_recv();                            // keep listening
