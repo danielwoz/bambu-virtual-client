@@ -614,8 +614,13 @@ VirtualSsdpDiscovery::rediscover_bridge(const std::string& dev_id, int timeout_m
                     auto h = parse_headers(pkt);
                     const std::string u = h["usn"];
                     if (usn_is_virtual(u)) {
-                        const uint16_t    p  = mqtt_port_from_headers(h);
-                        const std::string ip = from.address().to_string();
+                        const uint16_t p = mqtt_port_from_headers(h);
+                        // LOCATION IP is authoritative over the UDP source addr
+                        // (multi-homed host: reply can arrive from a WSL/Hyper-V
+                        // vEthernet interface the slicer can't reach).
+                        std::string ip = parse_location_host(h["location"]);
+                        if (ip.find('.') == std::string::npos)
+                            ip = from.address().to_string();
                         cache_port(u, p);
                         cache_ip(u, ip);
                         if (u == dev_id) {
